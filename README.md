@@ -157,103 +157,147 @@ Outgoing error messages can contain the following error types:
 - `remove_failed`: Could not remove TXT record  
 - `invalid_action`: Unknown action (must be "add" or "remove")
 
+## Architecture
+
+This service integrates into the Avassa ecosystem as follows:
+
+1. **Edge Deployment**: Runs on Avassa edge sites for distributed ACME challenge handling
+2. **Volga Integration**: Uses Avassa's Volga messaging for reliable request/response communication
+3. **Secrets Management**: Leverages Avassa Strongbox for secure credential storage
+4. **Token Management**: Automatically handles Avassa API token refresh for long-running operation
+
+The service acts as a bridge between ACME certificate managers and Cloudflare DNS, enabling automated certificate provisioning across distributed edge infrastructure.
+
 ## Avassa Deployment
 
-For deployment in Avassa, set up a workload with:
+This service is designed to run in the Avassa edge computing platform. Follow these steps to deploy:
 
-1. **Image**: Python 3.9+ with this module
-2. **Environment variables**: Configure as above
-3. **Secrets**: Cloudflare API token via Avassa secrets
-4. **AppRole**: Configure for Volga access
-5. **Resources**: Minimal CPU/memory (this is a lightweight service)
+### Prerequisites
 
-Example workload snippet:
-```yaml
-spec:
-  containers:
-  - name: acme-callback
-    image: your-registry/acme-callback:latest
-    env:
-    - name: CF_API_TOKEN
-      valueFrom:
-        secretKeyRef:
-          name: cloudflare-secret
-          key: api-token
-    - name: VOLGA_ROLE_ID 
-      value: "your-role-id"
-    - name: APPROLE_SECRET_ID
-      value: "${SYS_APPROLE_SECRET_ID}"
-    - name: API_CA_CERT
-      value: "${SYS_API_CA_CERT}"
-```
+1. **Container Registry**: Push the Docker image to your container registry
+2. **Avassa Access**: Ensure you have access to deploy applications in your Avassa tenant
+3. **Secrets Setup**: Configure required secrets in Avassa Strongbox
 
-## Docker
-
-### Using the Makefile (Recommended)
-
-The project includes a comprehensive Makefile for easy Docker management:
+### 1. Build and Push Container Image
 
 ```bash
-# Show all available commands
-make help
+# Build the Docker image
+make build IMAGE_NAME=your-registry/acme-cloudflare-callback IMAGE_TAG=1.0
 
-# Setup development environment (copies .env.template to .env and installs deps)
+# Push to your registry
+make push REGISTRY=your-registry.com
+```
+
+### 2. Configure Avassa Strongbox Secrets
+
+Create the required secrets in Avassa Strongbox using `supctl`:
+
+```bash
+# Create Cloudflare credentials vault
+supctl create strongbox-vault acme-secrets
+
+# Add Cloudflare API token
+supctl create strongbox-secret acme-secrets cloudflare-credentials \
+  --from-literal api-token="your_cloudflare_api_token"
+
+# Add Avassa credentials  
+supctl create strongbox-secret acme-secrets avassa-credentials \
+  --from-literal role-id="your_volga_role_id"
+```
+
+### 3. Deploy the Application
+
+Deploy using the provided Avassa specifications:
+
+```bash
+# First, create the application specification
+supctl apply -f avassa-app.yaml
+
+# Then, create the application deployment
+supctl apply -f avassa-deployment.yaml
+```
+
+Alternatively, you can create deployments manually with specific configurations:
+
+```bash
+# Create application deployment to target sites
+supctl create application-deployment acme-callback-deployment \
+  --application acme-cloudflare-callback \
+  --application-version "1.0" \
+  --placement "system/type = edge"
+```
+
+### 4. Monitor Deployment
+
+```bash
+# Check deployment status
+supctl get application-deployments acme-callback-deployment
+
+# View application logs
+supctl logs application acme-cloudflare-callback --service acme-callback
+
+# Check service status
+supctl get applications acme-cloudflare-callback
+```
+
+### Application Configuration
+
+The project includes two Avassa specification files:
+
+**Application Specification (`avassa-app.yaml`)**:
+- **Container Definition**: Docker image and runtime configuration
+- **Secrets Management**: Uses Avassa Strongbox for sensitive data like API tokens
+- **Service Variables**: Maps secrets to environment variables securely
+- **Environment Variables**: All configuration through environment variables
+- **Restart Policy**: Automatic restart on failure
+
+**Deployment Specification (`avassa-deployment.yaml`)**:
+- **Placement Rules**: Targets edge sites using placement constraints
+- **Canary Deployment**: Gradual rollout with staging environment validation
+- **Parallel Deployment**: Controls how many sites are updated simultaneously
+- **Success Thresholds**: Defines deployment success criteria
+
+### Site-Specific Deployment
+
+You can create custom deployment specifications for different environments. For example, create a production deployment:
+
+```yaml
+# avassa-deployment-prod.yaml
+name: acme-callback-prod
+application: acme-cloudflare-callback
+application-version: "1.0"
+placement: |
+  environment = production
+sites-in-parallel: 1
+canary-sites: |
+  city = stockholm
+canary-healthy-time: 30m
+success-threshold: 1.0
+```
+
+Then deploy:
+
+```bash
+# Deploy to production
+supctl apply -f avassa-deployment-prod.yaml
+
+# Or create deployments manually for specific configurations
+supctl create application-deployment acme-callback-test \
+  --application acme-cloudflare-callback \
+  --application-version "1.0" \
+  --placement "environment = test"
+```
+
+### Development and Testing
+
+For development, you can still use Docker locally:
+
+```bash
+# Setup local development environment
 make setup-dev
 
-# Build Docker image
-make build
-
-# Run with docker-compose (requires .env file)
-make run
-
-# View logs
-make logs
-
-# Stop services
-make stop
-
-# Clean up
-make clean
-```
-
-### Manual Docker Commands
-
-If you prefer to use Docker directly:
-
-```bash
-# Build the image
-docker build -t acme-callback .
-
-# Run with docker-compose
+# Run locally with Docker
 cp .env.template .env
 # Edit .env with your values
-docker-compose up -d
-```
-
-### Available Makefile Targets
-
-- `make build` - Build Docker image
-- `make run` - Run with docker-compose in background
-- `make run-fg` - Run with docker-compose in foreground
-- `make stop` - Stop running services
-- `make logs` - Show container logs
-- `make shell` - Open shell in running container
-- `make clean` - Remove Docker images and containers
-- `make lint` - Run Python code linting
-- `make test` - Run tests (when available)
-- `make setup-dev` - Setup development environment
-
-### Configuration
-
-The Makefile supports several variables:
-
-```bash
-# Build with custom image name/tag
-make build IMAGE_NAME=my-acme-callback IMAGE_TAG=v1.0
-
-# Push to registry
-make push REGISTRY=your-registry.com
-
-# Pull from registry
-make pull REGISTRY=your-registry.com
+make run-dev
 ```

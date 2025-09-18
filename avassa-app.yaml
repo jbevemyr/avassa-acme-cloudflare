@@ -1,0 +1,51 @@
+name: acme-cloudflare-callback
+version: "1.0"
+services:
+  - name: acme-callback
+    mode: replicated
+    replicas: 1
+    variables:
+      - name: CF_API_TOKEN
+        value-from-vault-secret:
+          vault: acme-secrets
+          secret: cloudflare-credentials
+          key: api-token
+      - name: VOLGA_ROLE_ID
+        value-from-vault-secret:
+          vault: acme-secrets
+          secret: avassa-credentials
+          key: role-id
+      - name: APPROLE_SECRET_ID
+        value: ${SYS_APPROLE_SECRET_ID}
+      - name: API_CA_CERT
+        value: ${SYS_API_CA_CERT}
+      - name: CF_API_BASE
+        value: https://api.cloudflare.com/client/v4
+      - name: CF_DEFAULT_TTL
+        value: "120"
+      - name: AVASSA_API_HOST
+        value: https://api.internal:4646
+      - name: VOLGA_TOPIC_IN
+        value: acme:requests
+      - name: VOLGA_TOPIC_OUT
+        value: acme:events
+      - name: VOLGA_CONSUMER_MODE
+        value: exclusive
+      - name: VOLGA_POSITION
+        value: latest
+    containers:
+      - name: acme-callback
+        image: your-registry/acme-cloudflare-callback:1.0
+        env:
+          CF_API_TOKEN: ${CF_API_TOKEN}
+          VOLGA_ROLE_ID: ${VOLGA_ROLE_ID}
+          APPROLE_SECRET_ID: ${APPROLE_SECRET_ID}
+          API_CA_CERT: ${API_CA_CERT}
+          CF_API_BASE: ${CF_API_BASE}
+          CF_DEFAULT_TTL: ${CF_DEFAULT_TTL}
+          AVASSA_API_HOST: ${AVASSA_API_HOST}
+          VOLGA_TOPIC_IN: ${VOLGA_TOPIC_IN}
+          VOLGA_TOPIC_OUT: ${VOLGA_TOPIC_OUT}
+          VOLGA_CONSUMER_MODE: ${VOLGA_CONSUMER_MODE}
+          VOLGA_POSITION: ${VOLGA_POSITION}
+        restart-policy: always

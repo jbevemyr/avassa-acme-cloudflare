@@ -1,0 +1,10 @@
+name: acme-callback-deployment
+application: acme-cloudflare-callback
+application-version: "1.0"
+placement: |
+  system/type = edge
+sites-in-parallel: 2
+canary-sites: |
+  environment = staging
+canary-healthy-time: 15m
+success-threshold: 1.0
