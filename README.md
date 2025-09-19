@@ -284,15 +284,18 @@ Create the required secrets in Avassa Strongbox using `supctl`:
 
 ```bash
 # Create Cloudflare credentials vault
-supctl create strongbox-vault acme-secrets
+supctl create strongbox vaults <<EOF
+name: acme-secrets
+EOF
 
 # Add Cloudflare API token
-supctl create strongbox-secret acme-secrets cloudflare-credentials \
-  --from-literal api-token="your_cloudflare_api_token"
+supctl create strongbox vaults acme-secrets secrets <<EOF
+name: avassa-credentials
+allow-image-access: [ "*" ]
+data:
+  api-token: "..."
+EOF
 
-# Add Avassa credentials  
-supctl create strongbox-secret acme-secrets avassa-credentials \
-  --from-literal role-id="your_volga_role_id"
 ```
 
 ### 3. Deploy the Application
@@ -301,111 +304,10 @@ Deploy using the provided Avassa specifications:
 
 ```bash
 # First, create the application specification
-supctl apply -f avassa-app.yaml
+supctl create applications < avassa-app.yaml
 
 # Then, create the application deployment
-supctl apply -f avassa-deployment.yaml
+supctl create application-deployment < avasas-deployment.yaml
 ```
 
-Alternatively, you can create deployments manually with specific configurations:
 
-```bash
-# Create application deployment to target sites
-supctl create application-deployment acme-callback-deployment \
-  --application acme-cloudflare-callback \
-  --application-version "1.0" \
-  --placement "system/type = edge"
-```
-
-### 4. Monitor Deployment
-
-```bash
-# Check deployment status
-supctl get application-deployments acme-callback-deployment
-
-# View application logs
-supctl logs application acme-cloudflare-callback --service acme-callback
-
-# Check service status
-supctl get applications acme-cloudflare-callback
-```
-
-### Application Configuration
-
-The project includes two Avassa specification files:
-
-**Application Specification (`avassa-app.yaml`)**:
-- **Container Definition**: Docker image and runtime configuration
-- **Secrets Management**: Uses Avassa Strongbox for sensitive data like API tokens
-- **Service Variables**: Maps secrets and configuration to environment variables
-- **Simplified Configuration**: Hardcoded Volga settings reduce configuration complexity
-- **Restart Policy**: Automatic restart on failure
-
-**Deployment Specification (`avassa-deployment.yaml`)**:
-- **Placement Rules**: Targets edge sites using placement constraints
-- **Canary Deployment**: Gradual rollout with staging environment validation
-- **Parallel Deployment**: Controls how many sites are updated simultaneously
-- **Success Thresholds**: Defines deployment success criteria
-
-### Site-Specific Deployment
-
-You can create custom deployment specifications for different environments and domain-specific instances:
-
-#### Domain-Specific Deployments
-
-For multi-instance deployments with domain filtering, create separate application specs:
-
-```bash
-# Deploy instance for example.com
-supctl apply -f avassa-app-example-com.yaml
-supctl apply -f avassa-deployment.yaml
-
-# Create additional instances for other domains by copying and modifying the app spec
-cp avassa-app-example-com.yaml avassa-app-testorg.yaml
-# Edit avassa-app-testorg.yaml to set MANAGED_DOMAINS to "test.org,demo.net"
-```
-
-#### Environment-Specific Deployments  
-
-For different environments, create production deployment:
-
-```yaml
-# avassa-deployment-prod.yaml
-name: acme-callback-prod
-application: acme-cloudflare-callback
-application-version: "1.0"
-placement: |
-  environment = production
-sites-in-parallel: 1
-canary-sites: |
-  city = stockholm
-canary-healthy-time: 30m
-success-threshold: 1.0
-```
-
-Then deploy:
-
-```bash
-# Deploy to production
-supctl apply -f avassa-deployment-prod.yaml
-
-# Or create deployments manually for specific configurations
-supctl create application-deployment acme-callback-test \
-  --application acme-cloudflare-callback \
-  --application-version "1.0" \
-  --placement "environment = test"
-```
-
-### Development and Testing
-
-For development, you can still use Docker locally:
-
-```bash
-# Setup local development environment
-make setup-dev
-
-# Run locally with Docker
-cp .env.template .env
-# Edit .env with your values
-make run-dev
-```
