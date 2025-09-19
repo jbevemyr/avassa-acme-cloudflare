@@ -1,7 +1,7 @@
 # Makefile for Avassa ACME Cloudflare Callback
 
 # Docker image configuration
-IMAGE_NAME ?= acme-callback
+IMAGE_NAME ?= avassa/acme-cloudflare-callback
 IMAGE_TAG ?= latest
 FULL_IMAGE_NAME = $(IMAGE_NAME):$(IMAGE_TAG)
 
@@ -89,13 +89,13 @@ run:
 
 # Run in foreground
 run-fg:
-	@echo "Starting service with docker-compose in foreground..."
+	@echo "Starting service with docker in foreground..."
 	@if [ ! -f .env ]; then \
 		echo "Warning: .env file not found. Copy .env.template to .env and configure it."; \
 		echo "cp .env.template .env"; \
 		exit 1; \
 	fi
-	docker-compose up
+	docker run --rm -it --env-file .env $(FULL_IMAGE_NAME)
 
 # Stop services
 stop:

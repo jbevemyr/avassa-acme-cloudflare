@@ -38,10 +38,10 @@ Configuration (environment variables):
   APPROLE_SECRET_ID   : required – injected by Avassa: ${SYS_APPROLE_SECRET_ID}
   API_CA_CERT         : injected by Avassa: ${SYS_API_CA_CERT}
   AVASSA_API_HOST     : optional – default https://api.internal:4646
-  VOLGA_TOPIC_IN      : optional – default acme:requests
-  VOLGA_TOPIC_OUT     : optional – default acme:events
-  VOLGA_CONSUMER_MODE : optional – exclusive | shared (default exclusive)
-  VOLGA_POSITION      : optional – beginning | latest (default latest)
+  MANAGED_DOMAINS     : optional – comma-separated domains this instance manages (if not set, handles all)
+
+  # Debugging
+  ACME_DEBUG_DNS_VERIFICATION : optional – enable DNS verification checks for debugging (true/false)
 
 Notes:
 - Zone discovery: we look up the Cloudflare zone by repeatedly stripping the left-most
@@ -54,6 +54,9 @@ Notes:
 - Token management: automatically refreshes Avassa API tokens before expiration using the
   /v1/state/strongbox/token/refresh endpoint. Tokens are refreshed 5 minutes before expiry.
 - Continuous processing: waits for and processes Volga messages one by one in an endless loop.
+- Domain filtering: supports multi-instance deployments where each instance manages specific domains.
+- Volga configuration: uses hardcoded topic names (acme:requests/acme:events) and shared consumer mode
+  for reliable multi-instance operation.
 """
 
 import asyncio
@@ -130,11 +133,125 @@ class CloudflareClient:
             "content": value,
             "ttl": ttl,
         }
+        logging.info(f"Creating TXT record: {name} = '{value}' (TTL: {ttl})")
         data = await self._request("POST", f"/zones/{zone_id}/dns_records", json=payload)
-        return data["result"]["id"]
+        record_id = data["result"]["id"]
+        logging.info(f"Successfully created TXT record {record_id} for {name}")
+        
+        # Add brief diagnostic info
+        try:
+            # Check the record was created correctly
+            await asyncio.sleep(0.5)  # Brief pause
+            records = await self.list_txt_records(zone_id, name)
+            matching_records = [r for r in records if r.get("content") == value]
+            if matching_records:
+                logging.info(f"Verified: TXT record for {name} is now active in Cloudflare DNS")
+            else:
+                logging.warning(f"Warning: Could not immediately verify TXT record for {name}")
+        except Exception as e:
+            logging.warning(f"Could not verify TXT record creation: {e}")
+            
+        return record_id
 
     async def delete_record(self, zone_id: str, record_id: str) -> None:
+        logging.info(f"Deleting DNS record {record_id} from zone {zone_id}")
         await self._request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
+        logging.info(f"Successfully deleted DNS record {record_id}")
+        
+    async def verify_dns_propagation(self, name: str, expected_value: str) -> dict:
+        """
+        Verify DNS propagation for debugging ACME validation failures.
+        This helps diagnose common issues like DNS propagation delays,
+        multiple conflicting records, or incorrect values.
+        """
+        try:
+            import socket
+            import dns.resolver
+        except ImportError:
+            return {
+                "fqdn": name,
+                "expected_value": expected_value,
+                "validation_issues": ["DNS verification requires dnspython package"]
+            }
+        
+        result = {
+            "fqdn": name,
+            "expected_value": expected_value,
+            "cloudflare_records": [],
+            "dns_resolution": {},
+            "validation_issues": []
+        }
+        
+        try:
+            # Get zone for this name
+            zone_id, zone_name = await self.find_zone_id(name)
+            
+            # Check Cloudflare records
+            records = await self.list_txt_records(zone_id, name)
+            result["cloudflare_records"] = [
+                {"id": r.get("id"), "content": r.get("content"), "ttl": r.get("ttl")} 
+                for r in records
+            ]
+            
+            # Check DNS resolution from different perspectives
+            dns_servers = [
+                ("Cloudflare", "1.1.1.1"),
+                ("Google", "8.8.8.8"),
+                ("System", None)  # Use system resolver
+            ]
+            
+            for server_name, server_ip in dns_servers:
+                try:
+                    resolver = dns.resolver.Resolver()
+                    if server_ip:
+                        resolver.nameservers = [server_ip]
+                    
+                    answers = resolver.resolve(name, 'TXT')
+                    txt_values = [str(rdata).strip('"') for rdata in answers]
+                    
+                    result["dns_resolution"][server_name] = {
+                        "success": True,
+                        "values": txt_values,
+                        "has_expected": expected_value in txt_values,
+                        "server": server_ip or "system"
+                    }
+                    
+                except Exception as e:
+                    result["dns_resolution"][server_name] = {
+                        "success": False,
+                        "error": str(e),
+                        "server": server_ip or "system"
+                    }
+            
+            # Analyze for common issues
+            cf_values = [r["content"] for r in result["cloudflare_records"]]
+            
+            if not cf_values:
+                result["validation_issues"].append("No TXT records found in Cloudflare")
+            elif expected_value not in cf_values:
+                result["validation_issues"].append(f"Expected value not found in Cloudflare records")
+            
+            # Check if DNS resolution is consistent
+            dns_servers_with_expected = [
+                name for name, info in result["dns_resolution"].items() 
+                if info.get("success") and info.get("has_expected")
+            ]
+            
+            if len(dns_servers_with_expected) == 0:
+                result["validation_issues"].append("Challenge value not resolved by any tested DNS servers")
+            elif len(dns_servers_with_expected) < len([s for s in result["dns_resolution"].values() if s.get("success")]):
+                result["validation_issues"].append("Challenge value not consistently resolved across DNS servers")
+            
+            # Check for multiple conflicting records
+            if len(cf_values) > 1:
+                unique_values = set(cf_values)
+                if len(unique_values) > 1:
+                    result["validation_issues"].append(f"Multiple conflicting TXT records found: {unique_values}")
+                    
+        except Exception as e:
+            result["validation_issues"].append(f"DNS verification failed: {str(e)}")
+            
+        return result
 
 
 class CloudflareError(Exception):
@@ -158,12 +275,21 @@ class AcmeWorker:
         self.approle_secret = os.environ["APPROLE_SECRET_ID"]
         self.api_host = os.getenv("AVASSA_API_HOST", "https://api.internal:4646")
         self.api_ca_cert = os.getenv("API_CA_CERT")
-        self.topic_in = os.getenv("VOLGA_TOPIC_IN", "acme:requests")
-        self.topic_out = os.getenv("VOLGA_TOPIC_OUT", "acme:events")
-        self.consumer_mode = os.getenv("VOLGA_CONSUMER_MODE", "exclusive")
-        self.position_pref = os.getenv("VOLGA_POSITION", "latest").lower()
-        if self.position_pref not in ("latest", "beginning"):
-            self.position_pref = "latest"
+        
+        # Hardcoded Volga settings - these rarely need to change
+        self.topic_in = "acme:requests"
+        self.topic_out = "acme:events"
+        self.consumer_mode = "shared"  # Shared mode for multi-instance deployment
+        self.position_pref = "latest"
+        
+        # Domain filtering for multi-instance deployment
+        managed_domains_str = os.getenv("MANAGED_DOMAINS", "")
+        self.managed_domains = set()
+        if managed_domains_str:
+            self.managed_domains = {domain.strip().lower() for domain in managed_domains_str.split(",") if domain.strip()}
+            logging.info(f"This instance manages domains: {', '.join(sorted(self.managed_domains))}")
+        else:
+            logging.info("This instance manages ALL domains (no domain filtering)")
         self.hostname = socket.gethostname()
         self._shutdown = asyncio.Event()
 
@@ -174,6 +300,29 @@ class AcmeWorker:
         self.refresh_margin_seconds = 300  # Refresh 5 minutes before expiry
         
         self.cf = CloudflareClient(self.cf_token, self.cf_base)
+
+    def _should_handle_domain(self, domain: str) -> bool:
+        """Check if this instance should handle the given domain."""
+        if not self.managed_domains:
+            # No domain filtering configured, handle all domains
+            return True
+            
+        if not domain:
+            return False
+            
+        domain_lower = domain.strip().lower()
+        
+        # Direct match
+        if domain_lower in self.managed_domains:
+            return True
+            
+        # Check if any managed domain is a parent of this domain
+        # e.g., if we manage "example.com", we should handle "sub.example.com"
+        for managed_domain in self.managed_domains:
+            if domain_lower.endswith(f".{managed_domain}"):
+                return True
+                
+        return False
 
     async def _make_session(self) -> avassa_client.Session:
         """Create a new session and track token expiration."""
@@ -269,13 +418,11 @@ class AcmeWorker:
                 await asyncio.sleep(60)
 
     def _position(self):
-        if self.position_pref == "beginning":
-            return volga.Position.beginning()
-        # Prefer tailing new messages only
+        # Always start from latest messages for ACME challenges
         try:
             return volga.Position.latest()
         except AttributeError:
-            # Fallback if older client lacks latest(): read nothing until new messages arrive
+            # Fallback if older client lacks latest()
             return volga.Position.beginning()
 
     async def run(self):
@@ -317,7 +464,19 @@ class AcmeWorker:
                             continue
                             
                         payload = msg.get("payload", {})
-                        logging.info(f"Received message: {payload.get('action', 'unknown')} for {payload.get('name', 'unknown')}")
+                        domain = payload.get('domain', '')
+                        action = payload.get('action', 'unknown')
+                        name = payload.get('name', 'unknown')
+                        
+                        logging.info(f"Received message: {action} for {name} (domain: {domain})")
+                        
+                        # Check if this instance should handle this domain
+                        if not self._should_handle_domain(domain):
+                            logging.info(f"Skipping message for domain '{domain}' - not managed by this instance")
+                            # Don't send acknowledgment, let other instances handle it
+                            continue
+                        
+                        logging.info(f"Processing message for managed domain: {domain}")
                         
                         # Process one message and publish result
                         ack = await self.handle_message(payload)
@@ -365,22 +524,94 @@ class AcmeWorker:
             zone_id, zone_name = await self.cf.find_zone_id(name)
 
             if action == "add":
-                # Idempotency: if record already exists with same content, reuse
+                logging.info(f"ADD challenge: {name} in zone {zone_name} (ID: {zone_id})")
+                
+                # Check for existing records (idempotency)
                 existing = await self.cf.list_txt_records(zone_id, name)
-                for rec in existing:
-                    if rec.get("content") == value:
-                        return {**base_ack, "status": "ok", "zone_id": zone_id, "record_id": rec.get("id")}
+                if existing:
+                    logging.info(f"Found {len(existing)} existing TXT record(s) for {name}:")
+                    for i, rec in enumerate(existing):
+                        content = rec.get("content", "")
+                        record_id = rec.get("id", "unknown")
+                        is_match = "✓ MATCH" if content == value else "✗ different"
+                        logging.info(f"  [{i+1}] {record_id}: '{content}' {is_match}")
+                        
+                        if content == value:
+                            logging.info(f"Reusing existing TXT record {record_id} for {name}")
+                            return {**base_ack, "status": "ok", "zone_id": zone_id, "record_id": record_id}
+                else:
+                    logging.info(f"No existing TXT records found for {name}")
+                
+                # Create new record
+                logging.info(f"Creating new TXT record for {name} with challenge value")
                 record_id = await self.cf.create_txt(zone_id, name, value, ttl)
+                
+                # Log success with diagnostic info
+                logging.info(f"✅ ACME challenge record created successfully:")
+                logging.info(f"   Domain: {domain}")
+                logging.info(f"   FQDN: {name}")
+                logging.info(f"   Zone: {zone_name} ({zone_id})")
+                logging.info(f"   Record ID: {record_id}")
+                logging.info(f"   TTL: {ttl}s")
+                logging.info(f"   Challenge Value: {value}")
+                
+                # Optional DNS verification for debugging (if environment variable is set)
+                if os.getenv("ACME_DEBUG_DNS_VERIFICATION", "").lower() == "true":
+                    try:
+                        logging.info("🔍 Running DNS verification check (debug mode)...")
+                        await asyncio.sleep(2)  # Allow some propagation time
+                        dns_check = await self.cf.verify_dns_propagation(name, value)
+                        
+                        if dns_check["validation_issues"]:
+                            logging.warning("⚠️ DNS verification found potential issues:")
+                            for issue in dns_check["validation_issues"]:
+                                logging.warning(f"   • {issue}")
+                        else:
+                            logging.info("✅ DNS verification passed - no issues detected")
+                            
+                        # Log DNS resolution status
+                        for server, info in dns_check["dns_resolution"].items():
+                            if info["success"]:
+                                status = "✅ Found" if info["has_expected"] else "❌ Missing"
+                                logging.info(f"   {server} DNS: {status} challenge value")
+                            else:
+                                logging.warning(f"   {server} DNS: ❌ Resolution failed - {info.get('error', 'unknown')}")
+                                
+                    except Exception as e:
+                        logging.warning(f"DNS verification check failed: {e}")
+                
                 return {**base_ack, "status": "ok", "zone_id": zone_id, "record_id": record_id}
 
             else:  # remove
+                logging.info(f"REMOVE challenge: {name} in zone {zone_name} (ID: {zone_id})")
+                
                 existing = await self.cf.list_txt_records(zone_id, name)
+                if existing:
+                    logging.info(f"Found {len(existing)} existing TXT record(s) for {name}:")
+                    for i, rec in enumerate(existing):
+                        content = rec.get("content", "")
+                        record_id = rec.get("id", "unknown")
+                        is_target = "✓ TARGET" if content == value else "✗ different"
+                        logging.info(f"  [{i+1}] {record_id}: '{content}' {is_target}")
+                else:
+                    logging.info(f"No existing TXT records found for {name}")
+                
                 target = next((r for r in existing if r.get("content") == value), None)
                 if not target:
-                    # Consider missing record as success (idempotent removal)
+                    logging.info(f"Target TXT record with value '{value}' not found - considering removal successful (idempotent)")
                     return {**base_ack, "status": "ok", "zone_id": zone_id, "record_id": None}
-                await self.cf.delete_record(zone_id, target["id"])
-                return {**base_ack, "status": "ok", "zone_id": zone_id, "record_id": target["id"]}
+                
+                target_id = target["id"]
+                logging.info(f"Removing TXT record {target_id} from {name}")
+                await self.cf.delete_record(zone_id, target_id)
+                
+                logging.info(f"✅ ACME challenge record removed successfully:")
+                logging.info(f"   Domain: {domain}")
+                logging.info(f"   FQDN: {name}")
+                logging.info(f"   Zone: {zone_name} ({zone_id})")
+                logging.info(f"   Removed Record ID: {target_id}")
+                
+                return {**base_ack, "status": "ok", "zone_id": zone_id, "record_id": target_id}
 
         except CloudflareError as e:
             return {**base_ack, "status": "error", "error": {"type": "cloudflare", "message": str(e)}, "zone_id": None, "record_id": None}

@@ -11,6 +11,8 @@ A Python callback module that listens on Volga topics for JSON messages instruct
 - ✅ Publishes acknowledgement messages on output topic
 - ✅ Automatic Avassa API token refresh before expiration
 - ✅ Continuous message processing with robust error handling
+- ✅ Multi-instance domain filtering for horizontal scaling
+- ✅ Shared consumer mode for concurrent processing
 - ✅ Complete error handling and logging
 - ✅ Configured via environment variables
 
@@ -45,10 +47,12 @@ export CF_DEFAULT_TTL="120"                                 # default
 
 # Avassa / Volga settings  
 export AVASSA_API_HOST="https://api.internal:4646"         # default
-export VOLGA_TOPIC_IN="acme:requests"                      # default
-export VOLGA_TOPIC_OUT="acme:events"                       # default
-export VOLGA_CONSUMER_MODE="exclusive"                     # default (or "shared")
-export VOLGA_POSITION="latest"                             # default (or "beginning")
+
+# Domain filtering (optional - for multi-instance deployments)
+export MANAGED_DOMAINS="example.com,test.org"              # comma-separated domains this instance manages
+
+# Debugging (optional)
+export ACME_DEBUG_DNS_VERIFICATION="true"                  # enable DNS verification checks for debugging validation failures
 ```
 
 ## Usage
@@ -129,6 +133,29 @@ _acme-challenge.www.example.co.uk
 
 - **Remove operations**: Only removes TXT records whose content exactly matches the specified value, leaving other TXT records at the same name intact.
 
+## Multi-Instance Domain Filtering
+
+The service supports horizontal scaling through domain-based partitioning:
+
+- **Domain-Specific Instances**: Each instance can be configured to handle specific domains using `MANAGED_DOMAINS`
+- **Shared Consumer Mode**: Uses Volga shared consumers to allow multiple instances to process messages concurrently
+- **Message Filtering**: Only processes messages for domains it manages, allowing other instances to handle their domains
+- **Hierarchical Domains**: If an instance manages "example.com", it also handles subdomains like "sub.example.com"
+- **No Filtering**: If `MANAGED_DOMAINS` is not set, the instance handles all domains (backward compatibility)
+
+### Example Multi-Instance Setup:
+
+```bash
+# Instance 1 - handles example.com and its subdomains
+export MANAGED_DOMAINS="example.com"
+
+# Instance 2 - handles test.org and demo.net
+export MANAGED_DOMAINS="test.org,demo.net"  
+
+# Instance 3 - handles all other domains
+# (don't set MANAGED_DOMAINS)
+```
+
 ## Token Management
 
 The service automatically manages Avassa API token refresh to ensure continuous operation:
@@ -139,14 +166,71 @@ The service automatically manages Avassa API token refresh to ensure continuous 
 - **Graceful Handling**: If token refresh fails, the service logs errors but continues attempting
 - **Continuous Operation**: The service maintains an endless loop processing Volga messages
 
+## Debugging ACME Validation Failures
+
+When ACME validation fails (like in your Pebble logs), the enhanced logging helps diagnose issues:
+
+### Enhanced Logging Features
+
+- **Detailed Challenge Operations**: Shows all existing TXT records and whether they match the expected challenge value
+- **Zone Information**: Logs which Cloudflare zone is being used and its ID
+- **Record Verification**: Confirms TXT records are created and visible in Cloudflare DNS
+- **DNS Verification Mode**: Optional comprehensive DNS resolution testing
+
+### Enable Debug Mode
+
+Set the `ACME_DEBUG_DNS_VERIFICATION=true` environment variable to enable comprehensive DNS verification:
+
+```bash
+export ACME_DEBUG_DNS_VERIFICATION=true
+```
+
+In debug mode, after creating challenge records, the service will:
+
+1. **Test DNS resolution** from multiple servers (Cloudflare 1.1.1.1, Google 8.8.8.8, system resolver)
+2. **Check propagation consistency** across different DNS servers
+3. **Identify common issues** like multiple conflicting records or propagation delays
+4. **Report validation problems** that might cause ACME verification to fail
+
+### Common Validation Failure Causes
+
+The debug logging helps identify these common issues:
+
+- **DNS Propagation Delays**: Record created in Cloudflare but not yet visible to ACME validators
+- **Multiple Conflicting Records**: Different TXT values for the same challenge name
+- **DNS Resolution Inconsistency**: Challenge visible on some DNS servers but not others
+- **Wrong Challenge Value**: TXT record content doesn't match ACME expectation
+- **TTL Issues**: Very short TTL causing records to expire before validation
+
+### Example Debug Output
+
+```
+✅ ACME challenge record created successfully:
+   Domain: foo.valudden17.com
+   FQDN: _acme-challenge.foo.valudden17.com
+   Zone: valudden17.com (1234567890abcdef)
+   Record ID: abcdef1234567890
+   TTL: 120s
+   Challenge Value: abc123def456...
+
+🔍 Running DNS verification check (debug mode)...
+   Cloudflare DNS: ✅ Found challenge value
+   Google DNS: ❌ Missing challenge value  
+   System DNS: ✅ Found challenge value
+
+⚠️ DNS verification found potential issues:
+   • Challenge value not consistently resolved across DNS servers
+```
+
 ## Logging
 
 The module uses Python's standard logging at INFO level. Logs include:
-- Connection to Volga
-- Cloudflare zone discovery
-- DNS record operations  
-- Message handling
-- Errors and warnings
+- Connection to Volga and token refresh events
+- Detailed challenge operations with existing record analysis
+- Cloudflare zone discovery and DNS record operations
+- Message handling with domain filtering decisions
+- Optional DNS verification and propagation testing
+- Comprehensive error reporting and warnings
 
 ## Error types
 
@@ -162,7 +246,7 @@ Outgoing error messages can contain the following error types:
 This service integrates into the Avassa ecosystem as follows:
 
 1. **Edge Deployment**: Runs on Avassa edge sites for distributed ACME challenge handling
-2. **Volga Integration**: Uses Avassa's Volga messaging for reliable request/response communication
+2. **Volga Integration**: Uses Avassa's Volga messaging with hardcoded topics (`acme:requests`/`acme:events`) and shared consumer mode for reliable multi-instance operation
 3. **Secrets Management**: Leverages Avassa Strongbox for secure credential storage
 4. **Token Management**: Automatically handles Avassa API token refresh for long-running operation
 
@@ -181,10 +265,13 @@ This service is designed to run in the Avassa edge computing platform. Follow th
 ### 1. Build and Push Container Image
 
 ```bash
-# Build the Docker image
-make build IMAGE_NAME=your-registry/acme-cloudflare-callback IMAGE_TAG=1.0
+# Build the Docker image (uses default image name: avassa/acme-cloudflare-callback)
+make build IMAGE_TAG=1.0
 
-# Push to your registry
+# Or build with explicit image name
+make build IMAGE_NAME=avassa/acme-cloudflare-callback IMAGE_TAG=1.0
+
+# Push to registry (if using external registry)
 make push REGISTRY=your-registry.com
 ```
 
@@ -247,8 +334,8 @@ The project includes two Avassa specification files:
 **Application Specification (`avassa-app.yaml`)**:
 - **Container Definition**: Docker image and runtime configuration
 - **Secrets Management**: Uses Avassa Strongbox for sensitive data like API tokens
-- **Service Variables**: Maps secrets to environment variables securely
-- **Environment Variables**: All configuration through environment variables
+- **Service Variables**: Maps secrets and configuration to environment variables
+- **Simplified Configuration**: Hardcoded Volga settings reduce configuration complexity
 - **Restart Policy**: Automatic restart on failure
 
 **Deployment Specification (`avassa-deployment.yaml`)**:
@@ -259,7 +346,25 @@ The project includes two Avassa specification files:
 
 ### Site-Specific Deployment
 
-You can create custom deployment specifications for different environments. For example, create a production deployment:
+You can create custom deployment specifications for different environments and domain-specific instances:
+
+#### Domain-Specific Deployments
+
+For multi-instance deployments with domain filtering, create separate application specs:
+
+```bash
+# Deploy instance for example.com
+supctl apply -f avassa-app-example-com.yaml
+supctl apply -f avassa-deployment.yaml
+
+# Create additional instances for other domains by copying and modifying the app spec
+cp avassa-app-example-com.yaml avassa-app-testorg.yaml
+# Edit avassa-app-testorg.yaml to set MANAGED_DOMAINS to "test.org,demo.net"
+```
+
+#### Environment-Specific Deployments  
+
+For different environments, create production deployment:
 
 ```yaml
 # avassa-deployment-prod.yaml
