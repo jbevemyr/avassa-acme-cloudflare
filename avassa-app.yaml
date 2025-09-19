@@ -5,7 +5,7 @@ services:
     mode: replicated
     replicas: 1
     variables:
-     - name: CF_API_TOKEN
+      - name: CF_API_TOKEN
         value-from-vault-secret:
           vault: acme-secrets
           secret: cloudflare-credentials
