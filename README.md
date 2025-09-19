@@ -22,6 +22,8 @@ A Python callback module that listens on Volga topics for JSON messages instruct
 pip install -r requirements.txt
 ```
 
+The service uses the [official Cloudflare Python library](https://pypi.org/project/cloudflare/) for robust, typed API interactions with Cloudflare's DNS services.
+
 ## Configuration
 
 All settings are retrieved from environment variables:

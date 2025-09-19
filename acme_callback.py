@@ -68,7 +68,8 @@ import logging
 import time
 from typing import Optional, Tuple
 
-import aiohttp
+from cloudflare import AsyncCloudflare
+from cloudflare._exceptions import CloudflareError
 import avassa_client
 import avassa_client.volga as volga
 
@@ -80,31 +81,11 @@ logging.basicConfig(
 
 # --------------------------- Cloudflare client ---------------------------
 class CloudflareClient:
-    def __init__(self, api_token: str, base: str = "https://api.cloudflare.com/client/v4", session: Optional[aiohttp.ClientSession] = None):
-        self.api_token = api_token
-        self.base = base.rstrip("/")
-        self._session = session
-
-    @property
-    def session(self) -> aiohttp.ClientSession:
-        if self._session is None:
-            self._session = aiohttp.ClientSession(headers={
-                "Authorization": f"Bearer {self.api_token}",
-                "Content-Type": "application/json",
-            })
-        return self._session
+    def __init__(self, api_token: str, base_url: str = "https://api.cloudflare.com/client/v4"):
+        self.client = AsyncCloudflare(api_token=api_token, base_url=base_url)
 
     async def close(self):
-        if self._session is not None:
-            await self._session.close()
-
-    async def _request(self, method: str, path: str, **kwargs) -> dict:
-        url = f"{self.base}{path}"
-        async with self.session.request(method, url, **kwargs) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status < 200 or resp.status >= 300 or not data.get("success", True):
-                raise CloudflareError(method, url, resp.status, data)
-            return data
+        await self.client.close()
 
     async def find_zone_id(self, fqdn: str) -> Tuple[str, str]:
         """Return (zone_id, zone_name) for the longest-matching zone for fqdn.
@@ -114,28 +95,30 @@ class CloudflareClient:
         for i in range(len(labels) - 1):  # require at least a.tld
             candidate = '.'.join(labels[i:])
             try:
-                data = await self._request("GET", f"/zones?name={candidate}")
-                result = data.get("result", [])
-                if result:
-                    return result[0]["id"], result[0]["name"]
-            except CloudflareError:
+                zones = await self.client.zones.list(name=candidate)
+                if zones.result:
+                    zone = zones.result[0]
+                    return zone.id, zone.name
+            except Exception:
                 pass  # try next shorter candidate
         raise ValueError(f"No Cloudflare zone found for {fqdn}")
 
     async def list_txt_records(self, zone_id: str, name: str) -> list:
-        data = await self._request("GET", f"/zones/{zone_id}/dns_records?type=TXT&name={name}")
-        return data.get("result", [])
+        records = await self.client.dns.records.list(zone_id=zone_id, type="TXT", name=name)
+        return [record.model_dump() for record in records.result]
 
     async def create_txt(self, zone_id: str, name: str, value: str, ttl: int) -> str:
-        payload = {
-            "type": "TXT",
-            "name": name,
-            "content": value,
-            "ttl": ttl,
-        }
         logging.info(f"Creating TXT record: {name} = '{value}' (TTL: {ttl})")
-        data = await self._request("POST", f"/zones/{zone_id}/dns_records", json=payload)
-        record_id = data["result"]["id"]
+        
+        record = await self.client.dns.records.create(
+            zone_id=zone_id,
+            type="TXT",
+            name=name,
+            content=value,
+            ttl=ttl
+        )
+        
+        record_id = record.id
         logging.info(f"Successfully created TXT record {record_id} for {name}")
         
         # Add brief diagnostic info
@@ -155,7 +138,7 @@ class CloudflareClient:
 
     async def delete_record(self, zone_id: str, record_id: str) -> None:
         logging.info(f"Deleting DNS record {record_id} from zone {zone_id}")
-        await self._request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
+        await self.client.dns.records.delete(record_id, zone_id=zone_id)
         logging.info(f"Successfully deleted DNS record {record_id}")
         
     async def verify_dns_propagation(self, name: str, expected_value: str) -> dict:
@@ -254,13 +237,7 @@ class CloudflareClient:
         return result
 
 
-class CloudflareError(Exception):
-    def __init__(self, method: str, url: str, status: int, payload: dict):
-        self.method = method
-        self.url = url
-        self.status = status
-        self.payload = payload
-        super().__init__(f"Cloudflare API error {status} for {method} {url}: {payload}")
+# CloudflareError is now provided by the official cloudflare library
 
 
 # ------------------------------ Worker ------------------------------
@@ -367,32 +344,34 @@ class AcmeWorker:
                 "Content-Type": "application/json"
             }
             
-            # Make the refresh request using aiohttp directly
-            async with aiohttp.ClientSession() as http_session:
-                if self.api_ca_cert:
-                    # If we have a CA cert, we'd need to configure SSL context
-                    # For now, we'll assume the session handles this
+            # Use the avassa_client session's HTTP functionality for token refresh
+            # The avassa_client should have built-in token refresh capabilities
+            if hasattr(self.session, 'refresh_token'):
+                # If the session has built-in refresh, use it
+                new_session = await self.session.refresh_token()
+                if new_session:
+                    self.session = new_session
+                    if hasattr(new_session, 'token'):
+                        self.token = new_session.token
+                    if hasattr(new_session, 'expires_in'):
+                        self.token_expires_at = time.time() + new_session.expires_in
+                    logging.info("Token refreshed successfully using session refresh")
+                    return True
+            
+            # Fallback: create a new session (this will get a fresh token)
+            logging.info("Refreshing token by creating new session...")
+            old_session = self.session
+            self.session = await self._make_session()
+            
+            # Clean up old session if possible
+            if hasattr(old_session, 'close'):
+                try:
+                    await old_session.close()
+                except:
                     pass
-                    
-                async with http_session.post(refresh_url, headers=headers) as resp:
-                    if resp.status == 200:
-                        refresh_data = await resp.json()
-                        
-                        # Update token information
-                        self.token = refresh_data.get("token")
-                        expires_in = refresh_data.get("expires-in", 0)
-                        self.token_expires_at = time.time() + expires_in
-                        
-                        # Update the session with new token
-                        if hasattr(self.session, 'token'):
-                            self.session.token = self.token
-                        
-                        logging.info(f"Token refreshed successfully, expires in {expires_in} seconds")
-                        return True
-                    else:
-                        error_data = await resp.json()
-                        logging.error(f"Token refresh failed: {resp.status} - {error_data}")
-                        return False
+            
+            logging.info("Token refreshed successfully with new session")
+            return True
                         
         except Exception as e:
             logging.error(f"Error refreshing token: {e}")
