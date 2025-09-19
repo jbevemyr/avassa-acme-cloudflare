@@ -1,0 +1,24 @@
+stages:
+  - build
+
+variables:
+  DOCKER_VERSION: "28" 
+
+build:
+  image: docker:${DOCKER_VERSION}-cli
+  stage: build
+  services:
+    - name: docker:${DOCKER_VERSION}
+  tags:
+    - avassa
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+    - echo -e '[registry."docker.io"]\n  mirrors = ["registry-mirror.lab.avassa.net"]\n' > buildkitd.toml
+    - docker buildx create --name ci --platform linux/amd64 --use --buildkitd-config buildkitd.toml default
+  
+  script:
+    - docker buildx build
+      -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}"
+      -t "${CI_REGISTRY_IMAGE}:latest"
+      --push
+      .

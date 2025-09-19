@@ -11,11 +11,14 @@ REGISTRY ?=
 # Container name for running
 CONTAINER_NAME ?= acme-callback-service
 
-.PHONY: help build run stop clean push pull logs shell test lint
+.PHONY: all help build run stop clean push pull logs shell test lint
 
-# Default target
+# Default target - build everything
+all: build
+
 help:
 	@echo "Available targets:"
+	@echo "  all       - Build everything (default target)"
 	@echo "  build     - Build Docker image"
 	@echo "  run       - Run container with docker-compose"
 	@echo "  stop      - Stop running container"

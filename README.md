@@ -265,7 +265,10 @@ This service is designed to run in the Avassa edge computing platform. Follow th
 ### 1. Build and Push Container Image
 
 ```bash
-# Build the Docker image (uses default image name: avassa/acme-cloudflare-callback)
+# Build the Docker image (uses default target - same as 'make build')
+make all IMAGE_TAG=1.0
+
+# Or build explicitly
 make build IMAGE_TAG=1.0
 
 # Or build with explicit image name
