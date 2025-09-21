@@ -24,6 +24,8 @@ pip install -r requirements.txt
 
 The service uses the [official Cloudflare Python library](https://pypi.org/project/cloudflare/) for robust, typed API interactions with Cloudflare's DNS services.
 
+**Alternative**: A simpler shell script implementation (`acme_callback.sh`) is also provided for basic integrations or testing scenarios.
+
 ## Configuration
 
 All settings are retrieved from environment variables:
