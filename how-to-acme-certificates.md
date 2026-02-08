@@ -25,7 +25,7 @@ Each scenario supports two DNS challenge handling methods:
 - **Distributed Vaults**: Automatically distribute certificates to all edge sites
 - **Auto-ACME Secrets**: Dynamic certificate provisioning based on service deployment context
 
-> **Important Note**: Static requests are only processed at the Control Tower. Edge sites can use manual `request-cert` commands or receive certificates via static requests configured at the Control Tower with targeted vault distribution.
+> **Important Note**: Static requests are only processed at the Control Tower. For edge sites, use auto-ACME certificates or consume secrets populated by Control Tower static-requests. Manual `request-cert` commands are primarily for testing and debugging.
 
 ## Scenario 1: Centralized Certificate Provisioning
 
@@ -238,11 +238,16 @@ EOF
 
 ## Scenario 2: Edge Site Certificate Provisioning
 
-For edge sites, Avassa provides two recommended approaches:
+For edge sites, there are two primary production methods to obtain certificates:
 
-## Approach 1: Auto-ACME Certificates (Recommended)
+1. **Auto-ACME certificates** - Certificates automatically provisioned based on secret configuration
+2. **Consuming distributed certificates** - Use certificates provisioned at Control Tower via static-requests
 
-Auto-ACME certificates are the simplest way to provision certificates for edge sites. The certificates are automatically requested, provisioned, and renewed.
+> Note: Manual `request-cert` commands are primarily for debugging and testing, not production use.
+
+## Approach 1: Auto-ACME Certificates (Primary Production Method)
+
+Auto-ACME certificates are the primary production method for edge site certificates. They are automatically requested, provisioned, and renewed when applications start.
 
 ### Step 1: Configure ACME Service
 
@@ -387,11 +392,11 @@ This will automatically generate certificates for names like `web.myapp.acme.edg
 - ✅ Works with dynamic service naming patterns
 - ✅ Scales automatically with application deployments
 
-## Approach 2: Static Requests with Targeted Distribution
+## Approach 2: Consuming Distributed Certificates
 
-Use static requests from the Control Tower to provision certificates and distribute them to specific edge sites.
+Edge sites consume certificates that are centrally provisioned at the Control Tower using static requests and distributed via targeted vaults.
 
-### Step 1: Create Targeted Distribution Vault
+### Step 1: Configure Static Request at Control Tower
 
 ```bash
 # Create vault that distributes to specific edge sites
@@ -402,18 +407,18 @@ distribute:
     - edge-site-01
     - edge-site-02
 EOF
-```
 
-### Step 2: Configure Static Request at Control Tower
-
-```bash
-# Configure static request for edge site certificates (only at Control Tower)
+# Configure static request for edge site certificates (at Control Tower)
 supctl create strongbox acme-services letsencrypt-prod static-requests <<EOF
 names: app.edge-site-01.yourcompany.com,api.edge-site-01.yourcompany.com
 vault: edge-site-certs
 secret: edge-01-certs
 EOF
 ```
+
+### Step 2: Consume Certificates at Edge Site
+
+Edge applications simply reference the distributed certificate vault:
 
 **Benefits of Static Requests approach:**
 - ✅ Centralized certificate management from Control Tower
@@ -424,8 +429,9 @@ EOF
 
 ### Step 3: Use Certificates in Edge Applications
 
-Both auto-ACME certificates and static request distributed certificates can be used in applications:
+Applications at edge sites can consume certificates from either approach:
 
+**Example: Using Auto-ACME certificates**
 ```bash
 supctl create applications <<EOF
 name: secure-web-app
@@ -436,7 +442,7 @@ services:
       - name: TLS_CERT
         value-from-vault-secret:
           vault: auto-certs
-          secret: service-cert
+          secret: service-cert  # Auto-ACME certificate
           key: acme-cert.pem
       - name: TLS_KEY  
         value-from-vault-secret:
@@ -448,11 +454,6 @@ services:
           vault: auto-certs
           secret: service-cert
           key: acme-chain.pem
-    network:
-      ingress-ip-per-instance:
-        protocols:
-          - name: tcp
-            port-ranges: "443"
     containers:
       - name: web-server
         image: nginx:alpine
@@ -460,6 +461,35 @@ services:
           TLS_CERT: ${TLS_CERT}
           TLS_KEY: ${TLS_KEY}
           TLS_CHAIN: ${TLS_CHAIN}
+    mode: replicated
+    replicas: 1
+EOF
+```
+
+**Example: Using distributed certificates from Control Tower**
+```bash
+supctl create applications <<EOF
+name: edge-web-app
+version: "1.0"
+services:
+  - name: web
+    variables:
+      - name: TLS_CERT
+        value-from-vault-secret:
+          vault: edge-site-certs
+          secret: edge-01-certs  # Distributed from Control Tower
+          key: acme-cert.pem
+      - name: TLS_KEY  
+        value-from-vault-secret:
+          vault: edge-site-certs
+          secret: edge-01-certs
+          key: acme-cert.key
+    containers:
+      - name: web-server
+        image: nginx:alpine
+        env:
+          TLS_CERT: ${TLS_CERT}
+          TLS_KEY: ${TLS_KEY}
     mode: replicated
     replicas: 1
 EOF
@@ -716,15 +746,16 @@ EOF
 # Certificate is automatically requested, renewed, and distributed
 ```
 
-**One-Time Request** (Manual, Temporary):
+**One-Time Request** (Debug/Testing Only):
 ```bash
-# Manually request certificate once
+# Manually request certificate for testing/debugging
 supctl do strongbox acme-services letsencrypt-prod request-cert \
   --names app.yourcompany.com
 
 # Check status
 supctl show strongbox acme-services letsencrypt-prod
 # Certificate is stored in ACME service, not automatically distributed
+# This method is primarily for testing and debugging purposes
 ```
 
 
@@ -748,6 +779,27 @@ auto-acme-cert:
     - ${SYS_SERVICE}.${SYS_APP}.${SYS_TENANT}.${SYS_SITE}.${SYS_GLOBAL_DOMAIN}
 EOF
 ```
+
+## Testing and Debugging
+
+### Manual Certificate Requests (Testing Only)
+
+For testing and debugging ACME configuration, you can manually request certificates:
+
+```bash
+# Test certificate request at Control Tower
+supctl do strongbox acme-services letsencrypt-staging request-cert \
+  --names test.yourcompany.com
+
+# Test certificate request at edge site (for local ACME service testing)
+supctl do --site edge-site-01 strongbox acme-services local-pebble request-cert \
+  --names test.edge-site-01.yourcompany.com
+
+# Check the result
+supctl show strongbox acme-services letsencrypt-staging
+```
+
+> **Note**: Manual `request-cert` commands are intended for testing and debugging only. Production deployments should use auto-ACME certificates or static requests.
 
 ## Monitoring and Troubleshooting
 
@@ -985,8 +1037,10 @@ Avassa's ACME integration provides flexible certificate provisioning suitable fo
 - **DNS Flexibility**: Support both DNS delegation and external DNS callbacks
 - **Multi-Instance Support**: Domain-specific callback services for horizontal scaling
 
-**Important**: Static requests are only processed at the Control Tower. For edge site certificates, the recommended approaches are:
+**Important**: Static requests are only processed at the Control Tower. For edge site certificates, the primary production methods are:
 1. **Auto-ACME secrets** - Certificates automatically provisioned when applications start
-2. **Static requests from Control Tower** - With targeted vault distribution to specific edge sites
+2. **Consuming distributed certificates** - From Control Tower static-requests with targeted vault distribution
+
+Manual `request-cert` commands are primarily for testing and debugging purposes.
 
 The callback-based approach using services like the Cloudflare ACME callback enables organizations to leverage existing DNS infrastructure while gaining the benefits of Avassa's distributed certificate management and automatic renewal.
