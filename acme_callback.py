@@ -55,8 +55,9 @@ Notes:
   /v1/state/strongbox/token/refresh endpoint. Tokens are refreshed 5 minutes before expiry.
 - Continuous processing: waits for and processes Volga messages one by one in an endless loop.
 - Domain filtering: supports multi-instance deployments where each instance manages specific domains.
-- Volga configuration: uses hardcoded topic names (acme:requests/acme:events) and shared consumer mode
-  for reliable multi-instance operation.
+- Volga configuration: uses hardcoded topic names (acme:requests/acme:events) addressed as parent topics
+  (volga.Topic.parent) so the container can run on a site while the topics live on the parent Control Tower.
+  Shared consumer mode is used for reliable multi-instance operation.
 """
 
 import asyncio
@@ -413,8 +414,8 @@ class AcmeWorker:
         try:
             create_wait = volga.CreateOptions.wait()
             create_json = volga.CreateOptions.create(fmt='json')
-            in_topic = volga.Topic.local(self.topic_in)
-            out_topic = volga.Topic.local(self.topic_out)
+            in_topic = volga.Topic.parent(self.topic_in)
+            out_topic = volga.Topic.parent(self.topic_out)
 
             logging.info(f"Starting ACME callback service, listening on topic: {self.topic_in}")
             

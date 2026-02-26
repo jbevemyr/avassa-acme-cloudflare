@@ -36,7 +36,7 @@ All settings are retrieved from environment variables:
 # Cloudflare API token with Zone DNS:Edit permissions for relevant zones
 export CF_API_TOKEN="your_cloudflare_token"
 
-# Avassa AppRole credentials  
+# Avassa AppRole credentials
 export VOLGA_ROLE_ID="your_role_id"
 export APPROLE_SECRET_ID="${SYS_APPROLE_SECRET_ID}"  # Injected by Avassa
 export API_CA_CERT="${SYS_API_CA_CERT}"              # Injected by Avassa
@@ -49,7 +49,7 @@ export API_CA_CERT="${SYS_API_CA_CERT}"              # Injected by Avassa
 export CF_API_BASE="https://api.cloudflare.com/client/v4"  # default
 export CF_DEFAULT_TTL="120"                                 # default
 
-# Avassa / Volga settings  
+# Avassa / Volga settings
 export AVASSA_API_HOST="https://api.internal:4646"         # default
 
 # Domain filtering (optional - for multi-instance deployments)
@@ -249,10 +249,10 @@ Outgoing error messages can contain the following error types:
 
 This service integrates into the Avassa ecosystem as follows:
 
-1. **Edge Deployment**: Runs on Avassa edge sites for distributed ACME challenge handling
-2. **Volga Integration**: Uses Avassa's Volga messaging with hardcoded topics (`acme:requests`/`acme:events`) and shared consumer mode for reliable multi-instance operation
-3. **Secrets Management**: Leverages Avassa Strongbox for secure credential storage
-4. **Token Management**: Automatically handles Avassa API token refresh for long-running operation
+1. **Site Deployment**: The container is deployed on Avassa **sites** (placement `system/type = site`). Tenants cannot deploy applications directly on Control Tower.
+2. **Parent Volga Topics**: The Volga topics (`acme:requests` / `acme:events`) live on the **parent Control Tower**. The container connects to the local site API (`api.internal:4646`) but addresses the topics as `volga.Topic.parent(...)` so that messages are routed to and from the parent CT topic, not a site-local one.
+3. **Secrets Management**: Leverages Avassa Strongbox for secure credential storage.
+4. **Token Management**: Automatically handles Avassa API token refresh for long-running operation.
 
 The service acts as a bridge between ACME certificate managers and Cloudflare DNS, enabling automated certificate provisioning across distributed edge infrastructure.
 
@@ -294,12 +294,11 @@ EOF
 
 # Add Cloudflare API token
 supctl create strongbox vaults acme-secrets secrets <<EOF
-name: avassa-credentials
+name: cloudflare-credentials
 allow-image-access: [ "*" ]
 data:
   api-token: "..."
 EOF
-
 ```
 
 ### 3. Deploy the Application
