@@ -143,7 +143,8 @@ class CloudflareClient:
         logging.info(f"Successfully deleted DNS record {record_id}")
         
     async def verify_dns_propagation(self, name: str, expected_value: str,
-                                       max_attempts: int = 5, retry_delay: float = 3.0) -> dict:
+                                       max_attempts: int = 10, retry_delay: float = 3.0,
+                                       max_retry_delay: float = 15.0) -> dict:
         """
         Verify DNS propagation for debugging ACME validation failures.
         Retries up to max_attempts times with increasing delays to account for
@@ -244,7 +245,7 @@ class CloudflareClient:
                     break
 
                 if attempt < max_attempts:
-                    wait = retry_delay * attempt
+                    wait = min(retry_delay * attempt, max_retry_delay)
                     logging.info(
                         f"   DNS check attempt {attempt}/{max_attempts}: "
                         f"records not yet visible, retrying in {wait:.0f}s..."
