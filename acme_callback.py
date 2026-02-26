@@ -142,14 +142,14 @@ class CloudflareClient:
         await self.client.dns.records.delete(record_id, zone_id=zone_id)
         logging.info(f"Successfully deleted DNS record {record_id}")
         
-    async def verify_dns_propagation(self, name: str, expected_value: str) -> dict:
+    async def verify_dns_propagation(self, name: str, expected_value: str,
+                                       max_attempts: int = 5, retry_delay: float = 3.0) -> dict:
         """
         Verify DNS propagation for debugging ACME validation failures.
-        This helps diagnose common issues like DNS propagation delays,
-        multiple conflicting records, or incorrect values.
+        Retries up to max_attempts times with increasing delays to account for
+        wildcard CNAME overrides and Cloudflare edge propagation delays.
         """
         try:
-            import socket
             import dns.resolver
         except ImportError:
             return {
@@ -157,84 +157,124 @@ class CloudflareClient:
                 "expected_value": expected_value,
                 "validation_issues": ["DNS verification requires dnspython package"]
             }
-        
+
         result = {
             "fqdn": name,
             "expected_value": expected_value,
             "cloudflare_records": [],
             "dns_resolution": {},
-            "validation_issues": []
+            "validation_issues": [],
+            "attempts": 0,
         }
-        
+
+        # Public DNS servers to check (System DNS excluded from retry success
+        # criteria since local overrides may hide the record)
+        public_dns_servers = [
+            ("Cloudflare", "1.1.1.1"),
+            ("Google", "8.8.8.8"),
+        ]
+        all_dns_servers = public_dns_servers + [("System", None)]
+
+        def _query_txt(server_ip: str | None) -> dict:
+            resolver = dns.resolver.Resolver()
+            if server_ip:
+                resolver.nameservers = [server_ip]
+            try:
+                answers = resolver.resolve(name, "TXT")
+                txt_values = [str(rdata).strip('"') for rdata in answers]
+                return {
+                    "success": True,
+                    "values": txt_values,
+                    "has_expected": expected_value in txt_values,
+                    "server": server_ip or "system",
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "server": server_ip or "system",
+                }
+
         try:
-            # Get zone for this name
             zone_id, zone_name = await self.find_zone_id(name)
-            
-            # Check Cloudflare records
+
+            # Verify the record exists in Cloudflare API
             records = await self.list_txt_records(zone_id, name)
             result["cloudflare_records"] = [
-                {"id": r.get("id"), "content": r.get("content"), "ttl": r.get("ttl")} 
+                {"id": r.get("id"), "content": r.get("content"), "ttl": r.get("ttl")}
                 for r in records
             ]
-            
-            # Check DNS resolution from different perspectives
-            dns_servers = [
-                ("Cloudflare", "1.1.1.1"),
-                ("Google", "8.8.8.8"),
-                ("System", None)  # Use system resolver
-            ]
-            
-            for server_name, server_ip in dns_servers:
-                try:
-                    resolver = dns.resolver.Resolver()
-                    if server_ip:
-                        resolver.nameservers = [server_ip]
-                    
-                    answers = resolver.resolve(name, 'TXT')
-                    txt_values = [str(rdata).strip('"') for rdata in answers]
-                    
-                    result["dns_resolution"][server_name] = {
-                        "success": True,
-                        "values": txt_values,
-                        "has_expected": expected_value in txt_values,
-                        "server": server_ip or "system"
-                    }
-                    
-                except Exception as e:
-                    result["dns_resolution"][server_name] = {
-                        "success": False,
-                        "error": str(e),
-                        "server": server_ip or "system"
-                    }
-            
-            # Analyze for common issues
             cf_values = [r["content"] for r in result["cloudflare_records"]]
-            
+
             if not cf_values:
                 result["validation_issues"].append("No TXT records found in Cloudflare")
             elif expected_value not in cf_values:
-                result["validation_issues"].append(f"Expected value not found in Cloudflare records")
-            
-            # Check if DNS resolution is consistent
-            dns_servers_with_expected = [
-                name for name, info in result["dns_resolution"].items() 
-                if info.get("success") and info.get("has_expected")
-            ]
-            
-            if len(dns_servers_with_expected) == 0:
-                result["validation_issues"].append("Challenge value not resolved by any tested DNS servers")
-            elif len(dns_servers_with_expected) < len([s for s in result["dns_resolution"].values() if s.get("success")]):
-                result["validation_issues"].append("Challenge value not consistently resolved across DNS servers")
-            
+                result["validation_issues"].append("Expected value not found in Cloudflare records")
+
             # Check for multiple conflicting records
             if len(cf_values) > 1:
                 unique_values = set(cf_values)
                 if len(unique_values) > 1:
-                    result["validation_issues"].append(f"Multiple conflicting TXT records found: {unique_values}")
-                    
+                    result["validation_issues"].append(
+                        f"Multiple conflicting TXT records found: {unique_values}"
+                    )
+
+            # Retry loop for DNS propagation
+            for attempt in range(1, max_attempts + 1):
+                result["attempts"] = attempt
+
+                dns_resolution = {}
+                for server_name, server_ip in all_dns_servers:
+                    dns_resolution[server_name] = await asyncio.get_event_loop().run_in_executor(
+                        None, _query_txt, server_ip
+                    )
+
+                public_ok = all(
+                    dns_resolution[s]["has_expected"]
+                    for s, _ in public_dns_servers
+                    if dns_resolution[s].get("success")
+                )
+                public_resolved = all(
+                    dns_resolution[s].get("success")
+                    for s, _ in public_dns_servers
+                )
+
+                if public_resolved and public_ok:
+                    result["dns_resolution"] = dns_resolution
+                    break
+
+                if attempt < max_attempts:
+                    wait = retry_delay * attempt
+                    logging.info(
+                        f"   DNS check attempt {attempt}/{max_attempts}: "
+                        f"records not yet visible, retrying in {wait:.0f}s..."
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    result["dns_resolution"] = dns_resolution
+
+            # Analyze final resolution result
+            dns_servers_with_expected = [
+                sname for sname, info in result["dns_resolution"].items()
+                if info.get("success") and info.get("has_expected")
+            ]
+            successful_servers = [
+                sname for sname, info in result["dns_resolution"].items()
+                if info.get("success")
+            ]
+
+            if len(dns_servers_with_expected) == 0:
+                result["validation_issues"].append(
+                    "Challenge value not resolved by any tested DNS servers"
+                )
+            elif len(dns_servers_with_expected) < len(successful_servers):
+                result["validation_issues"].append(
+                    "Challenge value not consistently resolved across DNS servers"
+                )
+
         except Exception as e:
             result["validation_issues"].append(f"DNS verification failed: {str(e)}")
-            
+
         return result
 
 
@@ -539,24 +579,33 @@ class AcmeWorker:
                 if os.getenv("ACME_DEBUG_DNS_VERIFICATION", "").lower() == "true":
                     try:
                         logging.info("🔍 Running DNS verification check (debug mode)...")
-                        await asyncio.sleep(2)  # Allow some propagation time
                         dns_check = await self.cf.verify_dns_propagation(name, value)
-                        
+                        attempts = dns_check.get("attempts", 1)
+
                         if dns_check["validation_issues"]:
-                            logging.warning("⚠️ DNS verification found potential issues:")
+                            logging.warning(
+                                f"⚠️ DNS verification found potential issues "
+                                f"(after {attempts} attempt(s)):"
+                            )
                             for issue in dns_check["validation_issues"]:
                                 logging.warning(f"   • {issue}")
                         else:
-                            logging.info("✅ DNS verification passed - no issues detected")
-                            
+                            logging.info(
+                                f"✅ DNS verification passed - no issues detected "
+                                f"(attempt {attempts})"
+                            )
+
                         # Log DNS resolution status
                         for server, info in dns_check["dns_resolution"].items():
-                            if info["success"]:
+                            if info.get("success"):
                                 status = "✅ Found" if info["has_expected"] else "❌ Missing"
                                 logging.info(f"   {server} DNS: {status} challenge value")
                             else:
-                                logging.warning(f"   {server} DNS: ❌ Resolution failed - {info.get('error', 'unknown')}")
-                                
+                                logging.warning(
+                                    f"   {server} DNS: ❌ Resolution failed - "
+                                    f"{info.get('error', 'unknown')}"
+                                )
+
                     except Exception as e:
                         logging.warning(f"DNS verification check failed: {e}")
                 
