@@ -12,7 +12,7 @@ services:
           key: api-token
     containers:
       - name: acme-callback
-        image: avassa/acme-cloudflare-callback:1.0
+        image: ghcr.io/jbevemyr/avassa-acme-cloudflare:latest
         approle: acme-callback
         env:
           CF_API_TOKEN: ${CF_API_TOKEN}

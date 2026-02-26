@@ -1,87 +1,93 @@
-# How to Set Up ACME Certificate Provisioning
+# Set Up ACME Certificate Provisioning for bevemyr.com, gt16.se and vininfo.org
 
-This guide explains how to configure automatic certificate provisioning using ACME services (like Let's Encrypt) in Avassa. It covers both centralized and distributed certificate management scenarios, with support for DNS delegation and external DNS callback methods.
+This guide describes how to configure automatic certificate provisioning using Let's Encrypt
+via the Avassa ACME integration with Cloudflare DNS callback (dns-01 challenge). It covers
+the complete setup for the following DNS zones managed in Cloudflare:
+
+- `bevemyr.com` — subdomains: `www`, `martin`, `nisse`, `jaktpass`, `lisa`, `cellar`
+- `gt16.se` — subdomains: `oauth2`, `bastu`
+- `vininfo.org` — subdomains: `www`
+
+These domains were previously managed by certbot using http-01 (webroot) validation.
+With the Avassa Cloudflare callback, webroot directories are no longer needed — challenges
+are handled entirely through Cloudflare's DNS API.
 
 ## Prerequisites
 
-- Avassa Control Tower and edge sites deployed
-- Access to modify DNS settings for your domains (either delegation or API access)
-- ACME service provider account (Let's Encrypt, internal ACME server, etc.)
+- Avassa Control Tower deployed
+- Domains `bevemyr.com`, `gt16.se` and `vininfo.org` managed in Cloudflare
+- Cloudflare API token with `Zone DNS:Edit` permission for all three zones
+- Docker image `ghcr.io/jbevemyr/avassa-acme-cloudflare:latest` accessible from your Avassa sites (published automatically from the `main` branch via GitHub Actions)
 
 ## Overview
 
-Avassa supports two primary ACME certificate provisioning scenarios:
+The setup uses **centralized certificate provisioning**:
 
-1. **Centralized Provisioning**: Certificates requested at Control Tower using static requests and automatically distributed to edge sites via distributed vaults
-2. **Edge Site Provisioning**: Certificates provisioned for edge sites using auto-ACME secrets or static requests from Control Tower with targeted distribution
+1. The Cloudflare callback service runs on the Control Tower, listening for ACME dns-01
+   challenges on the `acme:requests` Volga topic and creating/removing TXT records via
+   the Cloudflare API.
+2. Avassa Strongbox requests certificates from Let's Encrypt using static requests.
+3. Certificates are stored in a distributed vault and automatically pushed to all sites.
+4. Applications consume the certificates from the vault — no manual renewal needed.
 
-Each scenario supports two DNS challenge handling methods:
+> **Important**: Static requests are only processed at the Control Tower. For edge site
+> certificates, use auto-ACME secrets or consume secrets populated by Control Tower
+> static requests. Manual `request-cert` commands are primarily for testing and debugging.
 
-- **DNS Delegation**: DNS for the domain is delegated to the Avassa site
-- **DNS Callback**: External DNS provider (like Cloudflare) handles challenges via callback service
+## Step 1: Configure ACME Service at Control Tower
 
-**Key Features:**
-- **Static Requests**: Configure once, automatically provision and renew certificates (Control Tower only)
-- **Distributed Vaults**: Automatically distribute certificates to all edge sites
-- **Auto-ACME Secrets**: Dynamic certificate provisioning based on service deployment context
-
-> **Important Note**: Static requests are only processed at the Control Tower. For edge sites, use auto-ACME certificates or consume secrets populated by Control Tower static-requests. Manual `request-cert` commands are primarily for testing and debugging.
-
-## Scenario 1: Centralized Certificate Provisioning
-
-Use this approach when the same hostname is used across multiple edge sites, with local DNS pointing to the local service instance.
-
-### Step 1: Configure ACME Service at Control Tower
-
-Create an ACME service configuration for your certificate authority:
+Create ACME service configurations for Let's Encrypt. Always start with staging to
+verify that the DNS callback is working before switching to production.
 
 ```bash
-# For Let's Encrypt Staging
+# Let's Encrypt Staging (for testing)
 supctl create strongbox acme-services <<EOF
 name: letsencrypt-staging
-contact-email: admin@yourcompany.com
+contact-email: admin@bevemyr.com
 directory-url: https://acme-staging-v02.api.letsencrypt.org/directory
 callback-domains:
-  - yourcompany.com
-  - app.yourcompany.com
+  - bevemyr.com
+  - gt16.se
+  - vininfo.org
 EOF
 
-# For Let's Encrypt Production  
+# Let's Encrypt Production
 supctl create strongbox acme-services <<EOF
 name: letsencrypt-prod
-contact-email: admin@yourcompany.com
+contact-email: admin@bevemyr.com
 directory-url: https://acme-v02.api.letsencrypt.org/directory
 callback-domains:
-  - yourcompany.com
-  - app.yourcompany.com
+  - bevemyr.com
+  - gt16.se
+  - vininfo.org
 EOF
 ```
 
-### Step 2: Set Up DNS Callback Service (if using external DNS)
+## Step 2: Configure Secrets for Cloudflare
 
-If your DNS is managed by an external provider like Cloudflare, deploy the callback service:
-
-#### Create Secrets for DNS Provider
+Store the Cloudflare API token in Avassa Strongbox:
 
 ```bash
-# Create vault for DNS provider credentials
+# Create vault for ACME-related secrets
 supctl create strongbox vaults <<EOF
 name: acme-secrets
 EOF
 
-# Add Cloudflare API token
+# Add Cloudflare API token (Zone DNS:Edit for bevemyr.com, gt16.se, vininfo.org)
 supctl create strongbox vaults acme-secrets secrets <<EOF
 name: cloudflare-credentials
 allow-image-access: [ "*" ]
 data:
-  api-token: "your_cloudflare_api_token"
+  api-token: "YOUR_CLOUDFLARE_API_TOKEN"
 EOF
 ```
 
-#### Configure Callback Policies and Authentication
+## Step 3: Configure Callback Policy and AppRole
+
+The callback service needs access to the Volga topics used for ACME challenge coordination:
 
 ```bash
-# Create Volga topic policies
+# Create Volga topic policy
 supctl create policy policies <<EOF
 name: acme-callback
 volga:
@@ -96,7 +102,7 @@ volga:
         produce: allow
 EOF
 
-# Create AppRole for callback service
+# Create AppRole for the callback service
 supctl create strongbox authentication approles <<EOF
 name: acme-callback
 fixed-role-id: acme-role-id
@@ -109,10 +115,19 @@ distribute:
 EOF
 ```
 
-#### Deploy Callback Application
+## Step 4: Deploy the Cloudflare Callback Service
+
+A single callback instance handles all three zones since they share the same Cloudflare
+account and API token. `MANAGED_DOMAINS` is set to all three zones so the service
+responds to challenges for any subdomain under them.
+
+> **Note**: The callback service must run on an edge site, not on the Control Tower.
+> It subscribes to the `acme:requests` and `acme:events` Volga topics at the parent
+> (Control Tower) location using `Topic.parent()`, so ACME challenges issued by the
+> Control Tower's Strongbox are delivered to — and acknowledged by — the service
+> running on the edge site.
 
 ```bash
-# Deploy the ACME callback service
 supctl create applications <<EOF
 name: acme-cloudflare-callback
 version: "1.0"
@@ -126,40 +141,52 @@ services:
           vault: acme-secrets
           secret: cloudflare-credentials
           key: api-token
+      - name: CF_API_BASE
+        value: https://api.cloudflare.com/client/v4
+      - name: CF_DEFAULT_TTL
+        value: "120"
+      - name: AVASSA_API_HOST
+        value: https://api.internal:4646
+      - name: MANAGED_DOMAINS
+        value: "bevemyr.com,gt16.se,vininfo.org"
+      - name: ACME_DEBUG_DNS_VERIFICATION
+        value: "true"
+    network:
+      outbound-access:
+        allow-all: true
     containers:
       - name: acme-callback
-        image: avassa/acme-cloudflare-callback:1.0
+        image: ghcr.io/jbevemyr/avassa-acme-cloudflare:latest
         approle: acme-callback
         env:
           CF_API_TOKEN: ${CF_API_TOKEN}
           VOLGA_ROLE_ID: "acme-role-id"
           APPROLE_SECRET_ID: ${SYS_APPROLE_SECRET_ID}
           API_CA_CERT: ${SYS_API_CA_CERT}
-          CF_API_BASE: "https://api.cloudflare.com/client/v4"
-          CF_DEFAULT_TTL: "120"
-          AVASSA_API_HOST: "https://api.internal:4646"
-          MANAGED_DOMAINS: "yourcompany.com"
-          ACME_DEBUG_DNS_VERIFICATION: "true"
+          CF_API_BASE: ${CF_API_BASE}
+          CF_DEFAULT_TTL: ${CF_DEFAULT_TTL}
+          AVASSA_API_HOST: ${AVASSA_API_HOST}
+          MANAGED_DOMAINS: ${MANAGED_DOMAINS}
+          ACME_DEBUG_DNS_VERIFICATION: ${ACME_DEBUG_DNS_VERIFICATION}
         restart-policy: always
 EOF
 
-# Deploy to Control Tower
+# Deploy to the gt16 site
 supctl create application-deployments <<EOF
 name: acme-callback-deployment
 application: acme-cloudflare-callback
 application-version: "1.0"
 placement: |
-  system/type = control-tower
+  system/name = gt16
 sites-in-parallel: 1
 EOF
 ```
 
-### Step 3: Configure Automatic Certificate Distribution
+## Step 5: Create Distributed Certificate Vault
 
-Create a distributed vault that will receive the certificates:
+Create a distributed vault that receives the certificates and pushes them to all sites:
 
 ```bash
-# Create distributed certificate vault
 supctl create strongbox vaults <<EOF
 name: certs
 distribute:
@@ -167,38 +194,71 @@ distribute:
 EOF
 ```
 
-### Step 4: Configure Static Certificate Request
+## Step 6: Configure Static Certificate Requests
 
-Configure the ACME service to automatically request certificates and populate the distributed vault:
+Static requests cause Avassa to automatically request, renew and distribute the
+certificates. Start with staging to verify the full flow.
 
 ```bash
-# Configure static request for automatic certificate provisioning
+# Test with Let's Encrypt Staging first
 supctl create strongbox acme-services letsencrypt-staging static-requests <<EOF
-names: app.yourcompany.com,api.yourcompany.com
+names: >-
+  www.bevemyr.com,bevemyr.com,
+  martin.bevemyr.com,nisse.bevemyr.com,
+  jaktpass.bevemyr.com,lisa.bevemyr.com,
+  cellar.bevemyr.com,
+  oauth2.gt16.se,bastu.gt16.se,
+  www.vininfo.org,vininfo.org
 vault: certs
-secret: web-services
+secret: bevemyr-cert
 EOF
 ```
 
-The ACME service will now automatically:
-1. **Request certificates** for the specified names
-2. **Handle DNS challenges** (via callback or delegation)
-3. **Store certificates** in the `certs` vault under the specified secret name
-4. **Distribute** to all edge sites immediately
+Check that the certificate was provisioned successfully:
+
+```bash
+supctl show strongbox acme-services letsencrypt-staging
+supctl show strongbox vaults certs secrets bevemyr-cert
+```
+
+Once staging works, create the equivalent production static request:
+
+```bash
+supctl create strongbox acme-services letsencrypt-prod static-requests <<EOF
+names: >-
+  www.bevemyr.com,bevemyr.com,
+  martin.bevemyr.com,nisse.bevemyr.com,
+  jaktpass.bevemyr.com,lisa.bevemyr.com,
+  cellar.bevemyr.com,
+  oauth2.gt16.se,bastu.gt16.se,
+  www.vininfo.org,vininfo.org
+vault: certs
+secret: bevemyr-cert
+EOF
+```
+
+Avassa will now automatically:
+1. **Request the certificate** from Let's Encrypt for all eleven names
+2. **Handle DNS challenges** by sending requests to the callback service via Volga
+3. **Store the certificate** in the `certs` vault under the secret `bevemyr-cert`
+4. **Distribute** to all sites immediately
 5. **Renew automatically** before expiration
 
-The secret will be populated with standard ACME certificate files:
-- `acme-cert.pem` - The certificate
-- `acme-cert.key` - The private key  
-- `acme-chain.pem` - The certificate chain
+The secret contains three keys:
 
-### Step 5: Use Certificate in Edge Applications
+| Key | Content |
+|---|---|
+| `acme-cert.pem` | The certificate |
+| `acme-cert.key` | The private key |
+| `acme-chain.pem` | The certificate chain |
 
-Deploy applications that use the automatically distributed certificates:
+## Step 7: Use the Certificate in Applications
+
+Applications reference the certificate via vault secrets:
 
 ```bash
 supctl create applications <<EOF
-name: web-service
+name: my-web-app
 version: "1.0"
 services:
   - name: web
@@ -206,17 +266,17 @@ services:
       - name: TLS_CERT
         value-from-vault-secret:
           vault: certs
-          secret: web-services  # This matches the secret name from static-requests
+          secret: bevemyr-cert
           key: acme-cert.pem
       - name: TLS_KEY
         value-from-vault-secret:
           vault: certs
-          secret: web-services
+          secret: bevemyr-cert
           key: acme-cert.key
       - name: TLS_CHAIN
         value-from-vault-secret:
           vault: certs
-          secret: web-services
+          secret: bevemyr-cert
           key: acme-chain.pem
     network:
       ingress-ip-per-instance:
@@ -230,327 +290,28 @@ services:
           TLS_CERT: ${TLS_CERT}
           TLS_KEY: ${TLS_KEY}
           TLS_CHAIN: ${TLS_CHAIN}
-        # Configure nginx to use the certificates
     mode: replicated
     replicas: 1
 EOF
 ```
 
-## Scenario 2: Edge Site Certificate Provisioning
+## DNS Challenge Flow
 
-For edge sites, there are two primary production methods to obtain certificates:
+When Avassa needs to obtain or renew a certificate, the following sequence occurs:
 
-1. **Auto-ACME certificates** - Certificates automatically provisioned based on secret configuration
-2. **Consuming distributed certificates** - Use certificates provisioned at Control Tower via static-requests
-
-> Note: Manual `request-cert` commands are primarily for debugging and testing, not production use.
-
-## Approach 1: Auto-ACME Certificates (Primary Production Method)
-
-Auto-ACME certificates are the primary production method for edge site certificates. They are automatically requested, provisioned, and renewed when applications start.
-
-### Step 1: Configure ACME Service
-
-First ensure you have an ACME service configured (either at Control Tower or locally at the edge site):
-
-#### Option A: Using External ACME Service (Let's Encrypt)
-
-```bash
-# Configure for Let's Encrypt with DNS callback
-supctl create strongbox acme-services <<EOF
-name: letsencrypt-distributed
-contact-email: admin@yourcompany.com
-directory-url: https://acme-v02.api.letsencrypt.org/directory
-callback-domains:
-  - yourcompany.com
-EOF
-```
-
-#### Option B: Using Local ACME Service (Pebble)
-
-First deploy a local ACME server:
-
-```bash
-# Deploy Pebble ACME server at the site
-supctl create applications <<EOF
-name: pebble
-version: "1.0"  
-services:
-  - name: pebble
-    mode: replicated
-    replicas: 1
-    network:
-      ingress-ip-per-instance:
-        protocols:
-          - name: tcp
-            port-ranges: "14000,15000"
-        access:
-          allow-all: true
-      outbound-access:
-        allow-all: true
-    containers:
-      - name: pebble
-        image: ghcr.io/letsencrypt/pebble
-        cmd: [ "-config", "/test/config/pebble-config.json", "-strict" ]
-        env:
-          PEBBLE_VA_NOSLEEP: "0"
-          PEBBLE_VA_ALWAYS_VALID: "0"
-EOF
-
-# Deploy to specific site
-supctl create application-deployments <<EOF  
-name: pebble-deployment
-application: pebble
-application-version: "1.0"
-placement: |
-  system/name = your-edge-site
-sites-in-parallel: 1
-EOF
-```
-
-Then configure ACME service to use the local server:
-
-```bash
-# Wait for Pebble to start and get its CA certificate
-curl -k https://pebble-ingress-ip:14000/root > pebble.minica.pem
-
-# Configure ACME service for local Pebble
-supctl create strongbox acme-services <<EOF
-name: local-pebble
-contact-email: admin@yourcompany.com
-directory-url: https://pebble.pebble.tenant.sitename.site.test:14000/dir
-server-name-indication: pebble.pebble.tenant.sitename.site.test
-use-root-ca-certs: false
-tls-verify: false
-api-ca-cert: |
-$(cat pebble.minica.pem | sed 's/^/  /g')
-EOF
-```
-
-### Step 2: Deploy DNS Callback Service (if needed)
-
-If using external DNS, deploy the callback service to the same site where certificates will be requested:
-
-```bash
-# Deploy callback service to edge site
-supctl create application-deployments <<EOF
-name: callback-deployment
-application: acme-cloudflare-callback
-application-version: "1.0"
-placement: |
-  system/name = your-edge-site
-sites-in-parallel: 1
-EOF
-```
-
-### Step 2: Create Auto-ACME Certificate Vault
-
-Create a vault with automatic certificate provisioning:
-
-```bash
-# Create vault for auto-generated certificates
-supctl create strongbox vaults <<EOF
-name: auto-certs
-distribute:
-  to: all  # or specific sites if needed
-EOF
-
-# Configure auto-ACME certificate
-supctl create strongbox vaults auto-certs secrets <<EOF
-name: service-cert
-allow-image-access: [ "*" ]
-auto-acme-cert:
-  acme-service: letsencrypt-prod  # or your configured ACME service
-  names:
-    - myservice.yourcompany.com
-    - api.yourcompany.com
-EOF
-```
-
-#### Dynamic Certificate Names
-
-For certificates that automatically match your service deployment patterns:
-
-```bash
-# Certificate with dynamic naming based on deployment context
-supctl create strongbox vaults auto-certs secrets <<EOF
-name: dynamic-cert
-allow-image-access: [ "*" ]
-auto-acme-cert:
-  acme-service: letsencrypt-prod
-  names:
-    - ${SYS_SERVICE}.${SYS_APP}.${SYS_TENANT}.${SYS_SITE}.${SYS_GLOBAL_DOMAIN}
-EOF
-```
-
-This will automatically generate certificates for names like `web.myapp.acme.edge-site-01.site.test`.
-
-**Benefits of Auto-ACME approach:**
-- ✅ Certificates automatically provisioned when applications are deployed
-- ✅ No manual certificate management required
-- ✅ Automatic renewal handled by Avassa
-- ✅ Works with dynamic service naming patterns
-- ✅ Scales automatically with application deployments
-
-## Approach 2: Consuming Distributed Certificates
-
-Edge sites consume certificates that are centrally provisioned at the Control Tower using static requests and distributed via targeted vaults.
-
-### Step 1: Configure Static Request at Control Tower
-
-```bash
-# Create vault that distributes to specific edge sites
-supctl create strongbox vaults <<EOF
-name: edge-site-certs
-distribute:
-  to:
-    - edge-site-01
-    - edge-site-02
-EOF
-
-# Configure static request for edge site certificates (at Control Tower)
-supctl create strongbox acme-services letsencrypt-prod static-requests <<EOF
-names: app.edge-site-01.yourcompany.com,api.edge-site-01.yourcompany.com
-vault: edge-site-certs
-secret: edge-01-certs
-EOF
-```
-
-### Step 2: Consume Certificates at Edge Site
-
-Edge applications simply reference the distributed certificate vault:
-
-**Benefits of Static Requests approach:**
-- ✅ Centralized certificate management from Control Tower
-- ✅ Explicit control over which certificates are provisioned
-- ✅ Can target specific edge sites with vault distribution
-- ✅ Good for well-known, stable certificate requirements
-- ✅ Easy to monitor and troubleshoot from Control Tower
-
-### Step 3: Use Certificates in Edge Applications
-
-Applications at edge sites can consume certificates from either approach:
-
-**Example: Using Auto-ACME certificates**
-```bash
-supctl create applications <<EOF
-name: secure-web-app
-version: "1.0"
-services:
-  - name: web
-    variables:
-      - name: TLS_CERT
-        value-from-vault-secret:
-          vault: auto-certs
-          secret: service-cert  # Auto-ACME certificate
-          key: acme-cert.pem
-      - name: TLS_KEY  
-        value-from-vault-secret:
-          vault: auto-certs
-          secret: service-cert
-          key: acme-cert.key
-      - name: TLS_CHAIN
-        value-from-vault-secret:
-          vault: auto-certs
-          secret: service-cert
-          key: acme-chain.pem
-    containers:
-      - name: web-server
-        image: nginx:alpine
-        env:
-          TLS_CERT: ${TLS_CERT}
-          TLS_KEY: ${TLS_KEY}
-          TLS_CHAIN: ${TLS_CHAIN}
-    mode: replicated
-    replicas: 1
-EOF
-```
-
-**Example: Using distributed certificates from Control Tower**
-```bash
-supctl create applications <<EOF
-name: edge-web-app
-version: "1.0"
-services:
-  - name: web
-    variables:
-      - name: TLS_CERT
-        value-from-vault-secret:
-          vault: edge-site-certs
-          secret: edge-01-certs  # Distributed from Control Tower
-          key: acme-cert.pem
-      - name: TLS_KEY  
-        value-from-vault-secret:
-          vault: edge-site-certs
-          secret: edge-01-certs
-          key: acme-cert.key
-    containers:
-      - name: web-server
-        image: nginx:alpine
-        env:
-          TLS_CERT: ${TLS_CERT}
-          TLS_KEY: ${TLS_KEY}
-    mode: replicated
-    replicas: 1
-EOF
-```
-
-## DNS Challenge Methods
-
-### Method 1: DNS Delegation to Avassa
-
-When Avassa can manage DNS for your domain:
-
-1. **Delegate DNS subdomain** to your Avassa site's DNS server
-2. **Configure ACME service** without `callback-domains`
-3. **Avassa handles challenges automatically** using its built-in DNS server
-
-```bash
-# ACME service with DNS delegation (no callback-domains)
-supctl create strongbox acme-services <<EOF
-name: letsencrypt-delegated
-contact-email: admin@yourcompany.com
-directory-url: https://acme-v02.api.letsencrypt.org/directory
-# Note: no callback-domains - Avassa will handle DNS directly
-EOF
-```
-
-### Method 2: DNS Callback (External DNS Provider)
-
-When DNS is managed externally (registrar, Cloudflare, etc.):
-
-1. **Configure callback domains** in ACME service
-2. **Deploy callback service** that listens to `acme:requests` topic
-3. **Callback service manages DNS** via external provider API
-
-#### ACME Service Configuration
-
-```bash
-supctl create strongbox acme-services <<EOF
-name: letsencrypt-callback
-contact-email: admin@yourcompany.com
-directory-url: https://acme-v02.api.letsencrypt.org/directory
-callback-domains:
-  - yourcompany.com
-  - subsidiary.com
-EOF
-```
-
-#### Callback Message Flow
-
-**Challenge Add Request** (sent to `acme:requests` topic):
+**Challenge Add** (published to `acme:requests` topic):
 ```json
 {
   "action": "add",
-  "domain": "yourcompany.com",
+  "domain": "bevemyr.com",
   "ttl": 120,
   "value": "7J7pGj9O2Ye2OjaBhBRbGPlEUR7uqEBxRmvFv4B8maY",
-  "name": "_acme-challenge.app.yourcompany.com",
+  "name": "_acme-challenge.www.bevemyr.com",
   "id": "ee57cfef-66e1-4b71-8cf3-ba74599957a8"
 }
 ```
 
-**Challenge Response** (sent to `acme:events` topic):
+**Callback Response** (published to `acme:events` topic):
 ```json
 {
   "status": "ok",
@@ -558,489 +319,132 @@ EOF
 }
 ```
 
-**Challenge Remove Request**:
+**Challenge Remove** (after Let's Encrypt has validated):
 ```json
 {
-  "action": "remove", 
-  "domain": "yourcompany.com",
+  "action": "remove",
+  "domain": "bevemyr.com",
   "value": "7J7pGj9O2Ye2OjaBhBRbGPlEUR7uqEBxRmvFv4B8maY",
-  "name": "_acme-challenge.app.yourcompany.com",
+  "name": "_acme-challenge.www.bevemyr.com",
   "id": "fc80e166-fccd-4935-98ef-16184fb1b78c"
 }
 ```
 
-### Simple Shell Script Callback Example
-
-For simpler integrations or testing, you can use a shell script callback instead of the full Python service:
-
-```bash
-#!/bin/bash
-# Simple ACME DNS callback using supctl and curl
-
-# Configuration
-DNS_PROVIDER="cloudflare"  # or "manual" for testing
-CF_API_TOKEN="your_cloudflare_api_token"
-MANAGED_DOMAINS="yourcompany.com"
-
-# Listen for ACME requests and process them
-while true; do
-    # Consume message from Volga topic
-    message=$(supctl do volga topics acme:requests consume --payload-only --timeout 30s 2>/dev/null || true)
-    
-    if [[ -n "$message" ]]; then
-        # Parse message
-        action=$(echo "$message" | jq -r '.action')
-        domain=$(echo "$message" | jq -r '.domain')
-        name=$(echo "$message" | jq -r '.name')
-        value=$(echo "$message" | jq -r '.value')
-        id=$(echo "$message" | jq -r '.id')
-        
-        echo "Processing $action for $name (domain: $domain)"
-        
-        # Handle DNS challenge (implement your DNS provider logic here)
-        if [[ "$action" == "add" ]]; then
-            # Add TXT record to DNS
-            echo "Would add TXT record: $name = '$value'"
-            status="ok"
-        elif [[ "$action" == "remove" ]]; then
-            # Remove TXT record from DNS  
-            echo "Would remove TXT record: $name with value '$value'"
-            status="ok"
-        else
-            status="error"
-        fi
-        
-        # Send acknowledgment
-        ack_payload=$(jq -n --arg id "$id" --arg status "$status" '{id: $id, status: $status}')
-        echo "$ack_payload" | supctl do volga topics acme:events produce -
-        
-        echo "Sent acknowledgment: $status (ID: $id)"
-    fi
-done
-```
-
-A complete shell script implementation (`acme_callback.sh`) is provided in the project repository with:
-- Cloudflare API integration
-- Domain filtering support  
-- Error handling and logging
-- Manual mode for testing
-
-## Multi-Instance DNS Callback Setup
-
-For large deployments with multiple domains, deploy domain-specific callback instances:
-
-### Step 1: Create Domain-Specific Callback Instances
-
-```bash
-# Instance for primary domain
-supctl create applications <<EOF
-name: acme-callback-primary
-version: "1.0"
-services:
-  - name: acme-callback
-    variables:
-      - name: CF_API_TOKEN
-        value-from-vault-secret:
-          vault: acme-secrets
-          secret: cloudflare-credentials
-          key: api-token
-    containers:
-      - name: acme-callback
-        image: avassa/acme-cloudflare-callback:1.0
-        approle: acme-callback
-        env:
-          CF_API_TOKEN: ${CF_API_TOKEN}
-          VOLGA_ROLE_ID: "acme-role-id"
-          APPROLE_SECRET_ID: ${SYS_APPROLE_SECRET_ID}
-          API_CA_CERT: ${SYS_API_CA_CERT}
-          MANAGED_DOMAINS: "yourcompany.com"
-          ACME_DEBUG_DNS_VERIFICATION: "true"
-        restart-policy: always
-EOF
-
-# Instance for subsidiary domains  
-supctl create applications <<EOF
-name: acme-callback-subsidiary
-version: "1.0"
-services:
-  - name: acme-callback
-    variables:
-      - name: CF_API_TOKEN
-        value-from-vault-secret:
-          vault: acme-secrets
-          secret: cloudflare-credentials
-          key: api-token
-    containers:
-      - name: acme-callback
-        image: avassa/acme-cloudflare-callback:1.0
-        approle: acme-callback
-        env:
-          CF_API_TOKEN: ${CF_API_TOKEN}
-          VOLGA_ROLE_ID: "acme-role-id"
-          APPROLE_SECRET_ID: ${SYS_APPROLE_SECRET_ID}
-          API_CA_CERT: ${SYS_API_CA_CERT}
-          MANAGED_DOMAINS: "subsidiary.com,partner.org"
-          ACME_DEBUG_DNS_VERIFICATION: "false"
-        restart-policy: always
-EOF
-```
-
-### Step 2: Deploy Instances to Appropriate Sites
-
-```bash
-# Deploy primary domain handler to Control Tower
-supctl create application-deployments <<EOF
-name: callback-primary-deployment
-application: acme-callback-primary
-application-version: "1.0"
-placement: |
-  system/type = control-tower
-EOF
-
-# Deploy subsidiary handler to specific region
-supctl create application-deployments <<EOF
-name: callback-subsidiary-deployment
-application: acme-callback-subsidiary
-application-version: "1.0"  
-placement: |
-  region = us-west
-EOF
-```
-
-## Certificate Request Examples
-
-### Centralized Request with Static Request
-
-```bash
-# Create distributed vault for certificates
-supctl create strongbox vaults <<EOF
-name: certs
-distribute:
-  to: all
-EOF
-
-# Configure static request for automatic provisioning and distribution
-supctl create strongbox acme-services letsencrypt-prod static-requests <<EOF
-names: app.yourcompany.com,api.yourcompany.com
-vault: certs
-secret: app-certificates
-EOF
-
-# Check certificate status
-supctl show strongbox acme-services letsencrypt-prod
-
-# The certificates will be automatically provisioned and stored in the distributed vault
-# Available at all sites as: certs/app-certificates/{acme-cert.pem,acme-cert.key,acme-chain.pem}
-```
-
-### One-Time Request vs Static Request
-
-**Static Request** (Automatic, Persistent):
-```bash
-# Sets up automatic certificate provisioning
-supctl create strongbox acme-services letsencrypt-prod static-requests <<EOF
-names: app.yourcompany.com
-vault: certs  
-secret: app-cert
-EOF
-# Certificate is automatically requested, renewed, and distributed
-```
-
-**One-Time Request** (Debug/Testing Only):
-```bash
-# Manually request certificate for testing/debugging
-supctl do strongbox acme-services letsencrypt-prod request-cert \
-  --names app.yourcompany.com
-
-# Check status
-supctl show strongbox acme-services letsencrypt-prod
-# Certificate is stored in ACME service, not automatically distributed
-# This method is primarily for testing and debugging purposes
-```
-
-
-### Auto-ACME Certificate (Automatic Provisioning)
-
-Create a secret that automatically provisions certificates:
-
-```bash
-supctl create strongbox vaults <<EOF
-name: auto-ssl
-distribute:
-  to: all
-EOF
-
-supctl create strongbox vaults auto-ssl secrets <<EOF
-name: web-cert
-auto-acme-cert:
-  acme-service: letsencrypt-prod
-  names:
-    - web.yourcompany.com
-    - ${SYS_SERVICE}.${SYS_APP}.${SYS_TENANT}.${SYS_SITE}.${SYS_GLOBAL_DOMAIN}
-EOF
-```
+The callback service automatically discovers the correct Cloudflare zone by
+successively stripping labels from the left side of the record name until a matching
+zone is found (e.g. `_acme-challenge.cellar.bevemyr.com` → tries `cellar.bevemyr.com`
+→ tries `bevemyr.com` ✓).
 
 ## Testing and Debugging
 
-### Manual Certificate Requests (Testing Only)
-
-For testing and debugging ACME configuration, you can manually request certificates:
+### Manual Certificate Request (Testing Only)
 
 ```bash
-# Test certificate request at Control Tower
+# One-time test request (does not auto-renew or distribute)
 supctl do strongbox acme-services letsencrypt-staging request-cert \
-  --names test.yourcompany.com
+  --names www.bevemyr.com
 
-# Test certificate request at edge site (for local ACME service testing)
-supctl do --site edge-site-01 strongbox acme-services local-pebble request-cert \
-  --names test.edge-site-01.yourcompany.com
-
-# Check the result
+# Check result
 supctl show strongbox acme-services letsencrypt-staging
 ```
 
-> **Note**: Manual `request-cert` commands are intended for testing and debugging only. Production deployments should use auto-ACME certificates or static requests.
+> **Note**: Manual `request-cert` commands are for testing and debugging only.
+> Production use should rely on static requests.
 
 ## Monitoring and Troubleshooting
 
 ### Monitor ACME Operations
 
 ```bash
-# Check ACME service status and static requests
+# Check ACME service status and static request state
 supctl show strongbox acme-services letsencrypt-prod
 
-# Check specific static request status
+# Check static requests specifically
 supctl show strongbox acme-services letsencrypt-prod static-requests
 
-# Monitor certificate provisioning logs
+# Monitor ACME service logs
 supctl logs strongbox acme-services letsencrypt-prod
 
-# Check distributed certificate vault contents
-supctl show strongbox vaults certs secrets web-services
+# Check certificate contents in the vault
+supctl show strongbox vaults certs secrets bevemyr-cert
 
-# Verify certificate distribution to edge sites
-supctl show --site edge-site-01 strongbox vaults certs secrets web-services
+# Verify the certificate has been distributed to a site
+supctl show --site YOUR_SITE_NAME strongbox vaults certs secrets bevemyr-cert
 
-# Check callback service health (if using DNS callback)
+# Check callback service health
 supctl logs application acme-cloudflare-callback --service acme-callback
 ```
 
-### Monitor Volga Message Flow
+### Monitor the Volga Message Flow
 
 ```bash
-# Monitor challenge requests
+# Watch challenge requests in real time
 supctl do volga topics acme:requests consume --payload-only --follow
 
-# Monitor challenge responses  
+# Watch callback acknowledgements in real time
 supctl do volga topics acme:events consume --payload-only --follow
 ```
 
 ### Debug DNS Issues
 
-If using the Cloudflare callback service with debug mode enabled:
+The callback service is deployed with `ACME_DEBUG_DNS_VERIFICATION=true`. After
+creating each challenge record it probes the record from Cloudflare DNS (1.1.1.1),
+Google DNS (8.8.8.8) and the system resolver and reports any propagation
+inconsistencies. Look for these patterns in the callback service logs:
+
+```
+✅ ACME challenge record created successfully
+🔍 Running DNS verification check (debug mode)
+⚠️ DNS verification found potential issues
+```
+
+You can also verify challenge records directly:
 
 ```bash
-# Check callback service logs for DNS verification
-supctl logs application acme-cloudflare-callback --service acme-callback
-
-# Look for patterns like:
-# ✅ ACME challenge record created successfully
-# 🔍 Running DNS verification check (debug mode)
-# ⚠️ DNS verification found potential issues
+dig _acme-challenge.www.bevemyr.com TXT @1.1.1.1
+dig _acme-challenge.oauth2.gt16.se TXT @1.1.1.1
+dig _acme-challenge.vininfo.org TXT @1.1.1.1
 ```
 
 ### Common Issues and Solutions
 
 **Challenge Timeout**:
-- Check DNS propagation with `dig _acme-challenge.yourdomain.com TXT`
-- Verify callback service is running and processing messages
-- Check Volga topic permissions
+- Check that the TXT record was created in Cloudflare: `dig _acme-challenge.bevemyr.com TXT`
+- Verify the callback service is running and consuming messages from the `acme:requests` topic
+- Check Volga topic permissions on the `acme-callback` AppRole
 
-**DNS Resolution Issues**:
-- Enable debug mode in callback service (`ACME_DEBUG_DNS_VERIFICATION: "true"`)
-- Check if DNS records are created but not propagated
-- Verify DNS provider API credentials
+**`zone_not_found` Error in Callback Logs**:
+- Verify that the Cloudflare API token has `Zone DNS:Edit` permission for all three zones
+- Confirm that `MANAGED_DOMAINS` contains `bevemyr.com,gt16.se,vininfo.org`
+
+**Certificate Not Distributed to Edge Sites**:
+- Verify that the `certs` vault has `distribute: to: all`
+- Check that the edge site is online and connected to the Control Tower
 
 **Authentication Failures**:
 - Check AppRole configuration and token policies
-- Verify callback service has proper Volga topic access
+- Verify the callback service has proper Volga topic access
 - Check strongbox vault permissions
 
 ## Certificate Renewal
 
-ACME certificates are automatically renewed by Avassa:
+Once static requests are configured, Avassa handles the entire certificate lifecycle
+automatically — no cron jobs required:
 
-- **Auto-renewal**: Certificates are renewed automatically before expiration
-- **Distribution**: Renewed certificates are automatically distributed to edge sites
-- **Application restart**: Applications using the certificates are restarted when certificates are updated
-
-## Best Practices
-
-1. **Use staging environment first** - Always test with Let's Encrypt staging before production
-2. **Monitor certificate expiration** - Set up alerts for certificate renewal failures
-3. **Use domain-specific callbacks** - Deploy separate callback instances for different domains to improve reliability
-4. **Enable debug logging** - Use debug mode during initial setup to diagnose DNS issues
-5. **Test certificate distribution** - Verify certificates reach all edge sites correctly
-6. **Plan for failure scenarios** - Have backup procedures for manual certificate deployment
+- **Auto-renewal**: Strongbox renews certificates before expiration
+- **Distribution**: The renewed certificate is automatically pushed to all sites via
+  the distributed vault
+- **Application restart**: Applications consuming the certificate are restarted when
+  it is updated
 
 ## Security Considerations
 
-- **API Token Security**: Store DNS provider API tokens in Avassa Strongbox, never in plain text
-- **Certificate Distribution**: Use Avassa's encrypted strongbox distribution for certificate secrets
-- **Access Control**: Configure proper policies to limit which applications can access certificates
-- **Network Security**: Restrict callback service network access to only necessary endpoints
-
-## Complete Working Example
-
-Here's a complete example based on the provided test case, showing how to set up ACME certificate provisioning with Cloudflare DNS callback:
-
-### 1. Deploy Pebble ACME Server
-```bash
-# Create and deploy Pebble for testing
-supctl create applications <<EOF
-name: pebble
-version: "1.0"
-services:
-  - name: pebble
-    mode: replicated
-    replicas: 1
-    network:
-      ingress-ip-per-instance:
-        protocols:
-          - name: tcp
-            port-ranges: "14000,15000"
-        access:
-          allow-all: true
-      outbound-access:
-        allow-all: true
-    containers:
-      - name: pebble
-        image: ghcr.io/letsencrypt/pebble
-        cmd: [ "-config", "/test/config/pebble-config.json", "-strict" ]
-        env:
-          PEBBLE_VA_NOSLEEP: "0"
-          PEBBLE_VA_ALWAYS_VALID: "0"
-EOF
-
-supctl create application-deployments <<EOF
-name: pebble
-application: pebble  
-application-version: "1.0"
-placement: |
-  system/name = topdc
-sites-in-parallel: 1
-EOF
-```
-
-### 2. Configure Secrets and Callback Service
-```bash
-# Create secrets vault
-supctl create strongbox vaults <<EOF
-name: acme-secrets
-EOF
-
-supctl create strongbox vaults acme-secrets secrets <<EOF
-name: cloudflare-credentials
-allow-image-access: [ "*" ]
-data:
-  api-token: "your_cloudflare_api_token"
-EOF
-
-# Deploy Cloudflare callback service
-supctl create applications <<EOF
-name: cloudflare
-version: "1.0"
-services:
-  - name: cloudflare
-    mode: replicated
-    replicas: 1
-    variables:
-      - name: CF_API_TOKEN
-        value-from-vault-secret:
-          vault: acme-secrets
-          secret: cloudflare-credentials
-          key: api-token
-    network:
-      outbound-access:
-        allow-all: true
-    containers:
-      - name: cloudflare
-        image: avassa/acme-cloudflare-callback:1.0
-        approle: acme-callback
-        env:
-          CF_API_TOKEN: ${CF_API_TOKEN}
-          VOLGA_ROLE_ID: "acme-role-id"
-          APPROLE_SECRET_ID: ${SYS_APPROLE_SECRET_ID}
-          API_CA_CERT: ${SYS_API_CA_CERT}
-          MANAGED_DOMAINS: "valudden17.com"
-          ACME_DEBUG_DNS_VERIFICATION: "true"
-EOF
-```
-
-### 3. Configure ACME Service with Callback
-```bash
-# Configure ACME service with callback domains
-supctl create strongbox acme-services <<EOF
-name: pebble
-contact-email: admin@example.com
-directory-url: https://pebble.pebble.telco.topdc.site.test:14000/dir
-server-name-indication: pebble.pebble.telco.topdc.site.test
-tls-verify: false
-callback-domains:
-  - valudden17.com
-EOF
-```
-
-### 4. Set Up Automatic Certificate Distribution
-```bash
-# Create distributed vault
-supctl create strongbox vaults <<EOF
-name: certs
-distribute:
-  to: all
-EOF
-
-# Configure static request for automatic provisioning
-supctl create strongbox acme-services pebble static-requests <<EOF
-names: foo.valudden17.com
-vault: certs
-secret: kafka
-EOF
-```
-
-### 5. Verify Certificate Provisioning
-```bash
-# Check that certificate was provisioned
-supctl show strongbox vaults certs secrets kafka
-
-# Should show:
-# acme-cert.pem: |
-#   -----BEGIN CERTIFICATE-----
-#   ...
-#   -----END CERTIFICATE-----
-# acme-cert.key: |
-#   -----BEGIN PRIVATE KEY-----
-#   ...
-#   -----END PRIVATE KEY-----
-# acme-chain.pem: |
-#   -----BEGIN CERTIFICATE-----
-#   ...
-#   -----END CERTIFICATE-----
-```
-
-## Summary
-
-Avassa's ACME integration provides flexible certificate provisioning suitable for both centralized and distributed deployments:
-
-- **Static Requests**: Enable fully automated certificate provisioning and distribution (Control Tower only)
-- **Distributed Vaults**: Automatically distribute certificates to all edge sites
-- **DNS Flexibility**: Support both DNS delegation and external DNS callbacks
-- **Multi-Instance Support**: Domain-specific callback services for horizontal scaling
-
-**Important**: Static requests are only processed at the Control Tower. For edge site certificates, the primary production methods are:
-1. **Auto-ACME secrets** - Certificates automatically provisioned when applications start
-2. **Consuming distributed certificates** - From Control Tower static-requests with targeted vault distribution
-
-Manual `request-cert` commands are primarily for testing and debugging purposes.
-
-The callback-based approach using services like the Cloudflare ACME callback enables organizations to leverage existing DNS infrastructure while gaining the benefits of Avassa's distributed certificate management and automatic renewal.
+- **API Token**: The Cloudflare API token is stored in Avassa Strongbox and never
+  appears in plain text in application definitions
+- **Certificate Distribution**: Vault replication uses Avassa's encrypted strongbox
+  distribution channel
+- **Access Control**: The `allow-image-access` setting on the `cloudflare-credentials`
+  secret limits which container images can read the token
+- **Network Access**: The callback service has `outbound-access: allow-all` to reach
+  `api.cloudflare.com`; tighten this to the Cloudflare API CIDR range if your security
+  policy requires it
