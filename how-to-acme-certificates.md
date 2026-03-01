@@ -168,7 +168,6 @@ services:
           AVASSA_API_HOST: ${AVASSA_API_HOST}
           MANAGED_DOMAINS: ${MANAGED_DOMAINS}
           ACME_DEBUG_DNS_VERIFICATION: ${ACME_DEBUG_DNS_VERIFICATION}
-        restart-policy: always
 EOF
 
 # Deploy to the gt16 site
@@ -202,13 +201,19 @@ certificates. Start with staging to verify the full flow.
 ```bash
 # Test with Let's Encrypt Staging first
 supctl create strongbox acme-services letsencrypt-staging static-requests <<EOF
-names: >-
-  www.bevemyr.com,bevemyr.com,
-  martin.bevemyr.com,nisse.bevemyr.com,
-  jaktpass.bevemyr.com,lisa.bevemyr.com,
-  cellar.bevemyr.com,
-  oauth2.gt16.se,bastu.gt16.se,
-  www.vininfo.org,vininfo.org
+name: server-cert
+names:
+  - www.bevemyr.com
+  - bevemyr.com,
+  - martin.bevemyr.com
+  - nisse.bevemyr.com
+  - jaktpass.bevemyr.com
+  - lisa.bevemyr.com
+  - cellar.bevemyr.com
+  - oauth2.gt16.se
+  - bastu.gt16.se
+  - www.vininfo.org
+  - vininfo.org
 vault: certs
 secret: bevemyr-cert
 EOF
@@ -225,13 +230,19 @@ Once staging works, create the equivalent production static request:
 
 ```bash
 supctl create strongbox acme-services letsencrypt-prod static-requests <<EOF
-names: >-
-  www.bevemyr.com,bevemyr.com,
-  martin.bevemyr.com,nisse.bevemyr.com,
-  jaktpass.bevemyr.com,lisa.bevemyr.com,
-  cellar.bevemyr.com,
-  oauth2.gt16.se,bastu.gt16.se,
-  www.vininfo.org,vininfo.org
+name: server-cert
+names:
+  - www.bevemyr.com
+  - bevemyr.com,
+  - martin.bevemyr.com
+  - nisse.bevemyr.com
+  - jaktpass.bevemyr.com
+  - lisa.bevemyr.com
+  - cellar.bevemyr.com
+  - oauth2.gt16.se
+  - bastu.gt16.se,
+  - www.vininfo.org
+  - vininfo.org
 vault: certs
 secret: bevemyr-cert
 EOF

@@ -24,4 +24,3 @@ services:
           AVASSA_API_HOST: "https://api.internal:4646"
           MANAGED_DOMAINS: ${MANAGED_DOMAINS}
           ACME_DEBUG_DNS_VERIFICATION: "true"
-        restart-policy: always
