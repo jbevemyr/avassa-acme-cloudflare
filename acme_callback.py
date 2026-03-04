@@ -446,77 +446,104 @@ class AcmeWorker:
             # Fallback if older client lacks latest()
             return volga.Position.beginning()
 
-    async def run(self):
-        self.session = await self._make_session()
-        
-        # Start the token refresh background task
-        refresh_task = asyncio.create_task(self._token_refresh_task())
-        
-        try:
-            create_wait = volga.CreateOptions.wait()
-            create_json = volga.CreateOptions.create(fmt='json')
-            in_topic = volga.Topic.parent(self.topic_in)
-            out_topic = volga.Topic.parent(self.topic_out)
+    def _is_token_expired_error(self, e: Exception) -> bool:
+        err = str(e)
+        return "4200" in err or "Token expired" in err or "token expired" in err
 
-            logging.info(f"Starting ACME callback service, listening on topic: {self.topic_in}")
-            
-            async with volga.Consumer(
-                session=self.session,
-                consumer_name=f"acme-cf-{self.hostname}",
-                mode=self.consumer_mode,
-                position=self._position(),
-                topic=in_topic,
-                on_no_exists=create_wait,
-            ) as consumer, volga.Producer(
-                session=self.session,
-                producer_name=f"acme-cf-{self.hostname}",
-                topic=out_topic,
-                on_no_exists=create_json,
-            ) as producer:
-                await consumer.more(10)
-                logging.info("Ready to process ACME challenge requests...")
-                
-                while not self._shutdown.is_set():
-                    try:
-                        msg = await consumer.recv()
-                        if not msg:
-                            # No more messages, small delay and continue waiting
-                            await asyncio.sleep(0.2)
-                            continue
-                            
-                        payload = msg.get("payload", {})
-                        domain = payload.get('domain', '')
-                        action = payload.get('action', 'unknown')
-                        name = payload.get('name', 'unknown')
-                        
-                        logging.info(f"Received message: {action} for {name} (domain: {domain})")
-                        
-                        # Check if this instance should handle this domain
-                        if not self._should_handle_domain(domain):
-                            logging.info(f"Skipping message for domain '{domain}' - not managed by this instance")
-                            # Don't send acknowledgment, let other instances handle it
-                            continue
-                        
-                        logging.info(f"Processing message for managed domain: {domain}")
-                        
-                        # Process one message and publish result
-                        ack = await self.handle_message(payload)
-                        await producer.produce(ack)
-                        
-                        logging.info(f"Sent acknowledgment: {ack.get('status', 'unknown')}")
-                        
-                    except Exception as e:
-                        logging.error(f"Error processing message: {e}")
-                        # Continue processing other messages
+    async def run(self):
+        refresh_task = None
+
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    self.session = await self._make_session()
+
+                    # (Re)start the token refresh background task
+                    if refresh_task and not refresh_task.done():
+                        refresh_task.cancel()
+                        try:
+                            await refresh_task
+                        except asyncio.CancelledError:
+                            pass
+                    refresh_task = asyncio.create_task(self._token_refresh_task())
+
+                    create_wait = volga.CreateOptions.wait()
+                    create_json = volga.CreateOptions.create(fmt='json')
+                    in_topic = volga.Topic.parent(self.topic_in)
+                    out_topic = volga.Topic.parent(self.topic_out)
+
+                    logging.info(f"Starting ACME callback service, listening on topic: {self.topic_in}")
+
+                    reconnect = False
+                    async with volga.Consumer(
+                        session=self.session,
+                        consumer_name=f"acme-cf-{self.hostname}",
+                        mode=self.consumer_mode,
+                        position=self._position(),
+                        topic=in_topic,
+                        on_no_exists=create_wait,
+                    ) as consumer, volga.Producer(
+                        session=self.session,
+                        producer_name=f"acme-cf-{self.hostname}",
+                        topic=out_topic,
+                        on_no_exists=create_json,
+                    ) as producer:
+                        await consumer.more(10)
+                        logging.info("Ready to process ACME challenge requests...")
+
+                        while not self._shutdown.is_set():
+                            try:
+                                msg = await consumer.recv()
+                                if not msg:
+                                    await asyncio.sleep(0.2)
+                                    continue
+
+                                payload = msg.get("payload", {})
+                                domain = payload.get('domain', '')
+                                action = payload.get('action', 'unknown')
+                                name = payload.get('name', 'unknown')
+
+                                logging.info(f"Received message: {action} for {name} (domain: {domain})")
+
+                                if not self._should_handle_domain(domain):
+                                    logging.info(f"Skipping message for domain '{domain}' - not managed by this instance")
+                                    continue
+
+                                logging.info(f"Processing message for managed domain: {domain}")
+
+                                ack = await self.handle_message(payload)
+                                await producer.produce(ack)
+
+                                logging.info(f"Sent acknowledgment: {ack.get('status', 'unknown')}")
+
+                            except Exception as e:
+                                if self._is_token_expired_error(e):
+                                    logging.warning(f"Session token expired, reconnecting: {e}")
+                                    reconnect = True
+                                    break
+                                logging.error(f"Error processing message: {e}")
+                                continue
+
+                    if reconnect:
+                        logging.info("Reconnecting with a fresh session...")
+                        await asyncio.sleep(2)
                         continue
-                        
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    if self._shutdown.is_set():
+                        break
+                    logging.error(f"Connection error, reconnecting in 5s: {e}")
+                    await asyncio.sleep(5)
+
         finally:
-            # Clean up
-            refresh_task.cancel()
-            try:
-                await refresh_task
-            except asyncio.CancelledError:
-                pass
+            if refresh_task and not refresh_task.done():
+                refresh_task.cancel()
+                try:
+                    await refresh_task
+                except asyncio.CancelledError:
+                    pass
             await self.cf.close()
             logging.info("ACME callback service stopped")
 
