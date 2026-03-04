@@ -314,9 +314,8 @@ class AcmeWorker:
 
         # Token management
         self.session: Optional[avassa_client.Session] = None
-        self.token: Optional[str] = None
         self.token_expires_at: Optional[float] = None
-        self.refresh_margin_seconds = 300  # Refresh 5 minutes before expiry
+        self.refresh_margin_seconds = 300  # Proactive reconnect 5 minutes before expiry
         
         self.cf = CloudflareClient(self.cf_token, self.cf_base)
 
@@ -344,7 +343,7 @@ class AcmeWorker:
         return False
 
     async def _make_session(self) -> avassa_client.Session:
-        """Create a new session and track token expiration."""
+        """Create a new Avassa session and record token lifetime if available."""
         logging.info("Creating new Avassa session...")
         session = avassa_client.approle_login(
             host=self.api_host,
@@ -352,86 +351,36 @@ class AcmeWorker:
             secret_id=self.approle_secret,
             user_agent="volga-acme-cloudflare/1.0",
         )
-        
-        # Extract token information for refresh tracking
-        # Note: The avassa_client might store this internally, 
-        # but we need to track it for refresh logic
-        if hasattr(session, 'token'):
-            self.token = session.token
+
         if hasattr(session, 'expires_in'):
             self.token_expires_at = time.time() + session.expires_in
-            logging.info(f"Token expires in {session.expires_in} seconds")
-        
+            logging.info(f"Token expires in {session.expires_in}s "
+                         f"(proactive reconnect at -{self.refresh_margin_seconds}s)")
+        else:
+            self.token_expires_at = None
+            logging.info("Token lifetime unknown — relying on 4200 reconnect handler")
+
         return session
 
     def _needs_token_refresh(self) -> bool:
-        """Check if token needs to be refreshed."""
+        """Return True when we should proactively reconnect before token expiry."""
         if not self.token_expires_at:
             return False
         return time.time() >= (self.token_expires_at - self.refresh_margin_seconds)
 
-    async def _refresh_token(self) -> bool:
-        """Refresh the Avassa API token using the refresh endpoint."""
-        if not self.session or not self.token:
-            logging.warning("Cannot refresh token: no active session or token")
-            return False
-            
-        try:
-            # Use the session's internal HTTP client to make the refresh request
-            refresh_url = f"{self.api_host}/v1/state/strongbox/token/refresh"
-            
-            # Create headers for the request
-            headers = {
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json"
-            }
-            
-            # Use the avassa_client session's HTTP functionality for token refresh
-            # The avassa_client should have built-in token refresh capabilities
-            if hasattr(self.session, 'refresh_token'):
-                # If the session has built-in refresh, use it
-                new_session = await self.session.refresh_token()
-                if new_session:
-                    self.session = new_session
-                    if hasattr(new_session, 'token'):
-                        self.token = new_session.token
-                    if hasattr(new_session, 'expires_in'):
-                        self.token_expires_at = time.time() + new_session.expires_in
-                    logging.info("Token refreshed successfully using session refresh")
-                    return True
-            
-            # Fallback: create a new session (this will get a fresh token)
-            logging.info("Refreshing token by creating new session...")
-            old_session = self.session
-            self.session = await self._make_session()
-            
-            # Clean up old session if possible
-            if hasattr(old_session, 'close'):
-                try:
-                    await old_session.close()
-                except:
-                    pass
-            
-            logging.info("Token refreshed successfully with new session")
-            return True
-                        
-        except Exception as e:
-            logging.error(f"Error refreshing token: {e}")
-            return False
-
-    async def _token_refresh_task(self):
-        """Background task to monitor and refresh tokens."""
-        while not self._shutdown.is_set():
+    async def _token_refresh_task(self, reconnect_event: asyncio.Event) -> None:
+        """
+        Background task that triggers a graceful reconnect when the token is
+        approaching expiry.  Relies on the caller's reconnect_event so that the
+        Consumer/Producer are rebuilt together with the new session.
+        """
+        while not self._shutdown.is_set() and not reconnect_event.is_set():
             try:
                 if self._needs_token_refresh():
-                    logging.info("Token needs refresh, attempting to refresh...")
-                    success = await self._refresh_token()
-                    if not success:
-                        logging.error("Token refresh failed, service may become unavailable")
-                
-                # Check every 60 seconds
+                    logging.info("Token approaching expiry — triggering proactive reconnect")
+                    reconnect_event.set()
+                    break
                 await asyncio.sleep(60)
-                
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -486,6 +435,9 @@ class AcmeWorker:
                 try:
                     self.session = await self._make_session()
 
+                    # Create reconnect_event first so the refresh task can signal it
+                    reconnect_event = asyncio.Event()
+
                     # (Re)start the token refresh background task
                     if refresh_task and not refresh_task.done():
                         refresh_task.cancel()
@@ -493,7 +445,9 @@ class AcmeWorker:
                             await refresh_task
                         except asyncio.CancelledError:
                             pass
-                    refresh_task = asyncio.create_task(self._token_refresh_task())
+                    refresh_task = asyncio.create_task(
+                        self._token_refresh_task(reconnect_event)
+                    )
 
                     create_wait = volga.CreateOptions.wait()
                     create_json = volga.CreateOptions.create(fmt='json')
@@ -505,7 +459,6 @@ class AcmeWorker:
                         f"(max {max_concurrent} concurrent requests)"
                     )
 
-                    reconnect_event = asyncio.Event()
                     active_tasks: set[asyncio.Task] = set()
                     producer_lock = asyncio.Lock()
                     semaphore = asyncio.Semaphore(max_concurrent)
