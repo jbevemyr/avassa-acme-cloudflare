@@ -450,7 +450,35 @@ class AcmeWorker:
         err = str(e)
         return "4200" in err or "Token expired" in err or "token expired" in err
 
+    async def _process_message(
+        self,
+        payload: dict,
+        producer,
+        producer_lock: asyncio.Lock,
+        reconnect_event: asyncio.Event,
+    ) -> None:
+        """Handle one ACME challenge message in a background task."""
+        try:
+            ack = await self.handle_message(payload)
+            async with producer_lock:
+                await producer.produce(ack)
+            logging.info(f"Sent acknowledgment: {ack.get('status', 'unknown')}")
+        except Exception as e:
+            if self._is_token_expired_error(e):
+                logging.warning(f"Session token expired in task, triggering reconnect: {e}")
+                reconnect_event.set()
+            else:
+                logging.error(f"Error processing message: {e}")
+
+    async def _cancel_tasks(self, tasks: set) -> None:
+        """Cancel and await a set of asyncio tasks."""
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def run(self):
+        max_concurrent = int(os.getenv("ACME_MAX_CONCURRENT", "20"))
         refresh_task = None
 
         try:
@@ -472,9 +500,16 @@ class AcmeWorker:
                     in_topic = volga.Topic.parent(self.topic_in)
                     out_topic = volga.Topic.parent(self.topic_out)
 
-                    logging.info(f"Starting ACME callback service, listening on topic: {self.topic_in}")
+                    logging.info(
+                        f"Starting ACME callback service, listening on topic: {self.topic_in} "
+                        f"(max {max_concurrent} concurrent requests)"
+                    )
 
-                    reconnect = False
+                    reconnect_event = asyncio.Event()
+                    active_tasks: set[asyncio.Task] = set()
+                    producer_lock = asyncio.Lock()
+                    semaphore = asyncio.Semaphore(max_concurrent)
+
                     async with volga.Consumer(
                         session=self.session,
                         consumer_name=f"acme-cf-{self.hostname}",
@@ -488,14 +523,16 @@ class AcmeWorker:
                         topic=out_topic,
                         on_no_exists=create_json,
                     ) as producer:
-                        await consumer.more(10)
+                        await consumer.more(max_concurrent)
                         logging.info("Ready to process ACME challenge requests...")
 
-                        while not self._shutdown.is_set():
+                        while not self._shutdown.is_set() and not reconnect_event.is_set():
                             try:
                                 msg = await consumer.recv()
                                 if not msg:
                                     await asyncio.sleep(0.2)
+                                    # Prune completed tasks
+                                    active_tasks = {t for t in active_tasks if not t.done()}
                                     continue
 
                                 payload = msg.get("payload", {})
@@ -507,24 +544,38 @@ class AcmeWorker:
 
                                 if not self._should_handle_domain(domain):
                                     logging.info(f"Skipping message for domain '{domain}' - not managed by this instance")
+                                    await consumer.more(1)
                                     continue
 
                                 logging.info(f"Processing message for managed domain: {domain}")
 
-                                ack = await self.handle_message(payload)
-                                await producer.produce(ack)
+                                async def _run(p=payload):
+                                    async with semaphore:
+                                        await self._process_message(
+                                            p, producer, producer_lock, reconnect_event
+                                        )
 
-                                logging.info(f"Sent acknowledgment: {ack.get('status', 'unknown')}")
+                                task = asyncio.create_task(_run())
+                                active_tasks.add(task)
+                                task.add_done_callback(active_tasks.discard)
+
+                                # Replenish one consumer credit per accepted task
+                                await consumer.more(1)
 
                             except Exception as e:
                                 if self._is_token_expired_error(e):
                                     logging.warning(f"Session token expired, reconnecting: {e}")
-                                    reconnect = True
+                                    reconnect_event.set()
                                     break
-                                logging.error(f"Error processing message: {e}")
+                                logging.error(f"Error receiving message: {e}")
                                 continue
 
-                    if reconnect:
+                        # Wait for in-flight tasks before tearing down
+                        if active_tasks:
+                            logging.info(f"Waiting for {len(active_tasks)} in-flight task(s)...")
+                            await asyncio.gather(*active_tasks, return_exceptions=True)
+
+                    if reconnect_event.is_set():
                         logging.info("Reconnecting with a fresh session...")
                         await asyncio.sleep(2)
                         continue
