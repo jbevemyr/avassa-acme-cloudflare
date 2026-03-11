@@ -57,7 +57,8 @@ Notes:
 - Domain filtering: supports multi-instance deployments where each instance manages specific domains.
 - Volga configuration: uses hardcoded topic names (acme:requests/acme:events) addressed as parent topics
   (volga.Topic.parent) so the container can run on a site while the topics live on the parent Control Tower.
-  Shared consumer mode is used for reliable multi-instance operation.
+- Consumer mode: shared mode is used when handling all domains; exclusive mode is forced when
+  MANAGED_DOMAINS is configured to prevent filtered messages from being dropped.
 """
 
 import asyncio
@@ -80,6 +81,14 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+def _redact_value(value: Optional[str]) -> str:
+    """Redact sensitive values in logs while keeping enough context for debugging."""
+    if not value:
+        return "<empty>"
+    if len(value) <= 10:
+        return f"{value[:2]}...{value[-2:]}"
+    return f"{value[:6]}...{value[-4:]}"
+
 # --------------------------- Cloudflare client ---------------------------
 class CloudflareClient:
     def __init__(self, api_token: str, base_url: str = "https://api.cloudflare.com/client/v4"):
@@ -95,13 +104,10 @@ class CloudflareClient:
         labels = fqdn.strip('.').split('.')
         for i in range(len(labels) - 1):  # require at least a.tld
             candidate = '.'.join(labels[i:])
-            try:
-                zones = await self.client.zones.list(name=candidate)
-                if zones.result:
-                    zone = zones.result[0]
-                    return zone.id, zone.name
-            except Exception:
-                pass  # try next shorter candidate
+            zones = await self.client.zones.list(name=candidate)
+            if zones.result:
+                zone = zones.result[0]
+                return zone.id, zone.name
         raise ValueError(f"No Cloudflare zone found for {fqdn}")
 
     async def list_txt_records(self, zone_id: str, name: str) -> list:
@@ -109,7 +115,7 @@ class CloudflareClient:
         return [record.model_dump() for record in records.result]
 
     async def create_txt(self, zone_id: str, name: str, value: str, ttl: int) -> str:
-        logging.info(f"Creating TXT record: {name} = '{value}' (TTL: {ttl})")
+        logging.info(f"Creating TXT record: {name} = '{_redact_value(value)}' (TTL: {ttl})")
         
         record = await self.client.dns.records.create(
             zone_id=zone_id,
@@ -298,7 +304,7 @@ class AcmeWorker:
         # Hardcoded Volga settings - these rarely need to change
         self.topic_in = "acme:requests"
         self.topic_out = "acme:events"
-        self.consumer_mode = "shared"  # Shared mode for multi-instance deployment
+        self.consumer_mode = "shared"
         self.position_pref = "latest"
         
         # Domain filtering for multi-instance deployment
@@ -307,6 +313,10 @@ class AcmeWorker:
         if managed_domains_str:
             self.managed_domains = {domain.strip().lower() for domain in managed_domains_str.split(",") if domain.strip()}
             logging.info(f"This instance manages domains: {', '.join(sorted(self.managed_domains))}")
+            # With domain filtering, shared consumers can drop messages that another
+            # instance should handle. Use exclusive mode so all instances see messages.
+            self.consumer_mode = "exclusive"
+            logging.info("Domain filtering enabled: forcing consumer mode to 'exclusive'")
         else:
             logging.info("This instance manages ALL domains (no domain filtering)")
         self.hostname = socket.gethostname()
@@ -388,12 +398,15 @@ class AcmeWorker:
                 await asyncio.sleep(60)
 
     def _position(self):
-        # Always start from latest messages for ACME challenges
-        try:
-            return volga.Position.latest()
-        except AttributeError:
-            # Fallback if older client lacks latest()
-            return volga.Position.beginning()
+        # Only process messages that arrive after this container starts.
+        # Never fall back to beginning() — that would replay old challenges.
+        if not hasattr(volga.Position, 'latest'):
+            raise RuntimeError(
+                "volga.Position.latest() is not available in this client version. "
+                "Refusing to start to avoid replaying old ACME challenges."
+            )
+        logging.info("Consumer position: latest (skipping historical messages)")
+        return volga.Position.latest()
 
     def _is_token_expired_error(self, e: Exception) -> bool:
         err = str(e)
@@ -538,8 +551,8 @@ class AcmeWorker:
                 except Exception as e:
                     if self._shutdown.is_set():
                         break
-                    logging.error(f"Connection error, reconnecting in 5s: {e}")
-                    await asyncio.sleep(5)
+                    logging.critical(f"Fatal error, exiting so the container can restart: {e}")
+                    raise
 
         finally:
             if refresh_task and not refresh_task.done():
@@ -586,7 +599,9 @@ class AcmeWorker:
                         content = rec.get("content", "")
                         record_id = rec.get("id", "unknown")
                         is_match = "✓ MATCH" if content == value else "✗ different"
-                        logging.info(f"  [{i+1}] {record_id}: '{content}' {is_match}")
+                        logging.info(
+                            f"  [{i+1}] {record_id}: '{_redact_value(content)}' {is_match}"
+                        )
                         
                         if content == value:
                             logging.info(f"Reusing existing TXT record {record_id} for {name}")
@@ -605,7 +620,7 @@ class AcmeWorker:
                 logging.info(f"   Zone: {zone_name} ({zone_id})")
                 logging.info(f"   Record ID: {record_id}")
                 logging.info(f"   TTL: {ttl}s")
-                logging.info(f"   Challenge Value: {value}")
+                logging.info(f"   Challenge Value: {_redact_value(value)}")
                 
                 # Optional DNS verification for debugging (if environment variable is set)
                 if os.getenv("ACME_DEBUG_DNS_VERIFICATION", "").lower() == "true":
@@ -653,7 +668,9 @@ class AcmeWorker:
                         content = rec.get("content", "")
                         record_id = rec.get("id", "unknown")
                         is_target = "✓ TARGET" if content == value else "✗ different"
-                        logging.info(f"  [{i+1}] {record_id}: '{content}' {is_target}")
+                        logging.info(
+                            f"  [{i+1}] {record_id}: '{_redact_value(content)}' {is_target}"
+                        )
                 else:
                     logging.info(f"No existing TXT records found for {name}")
                 
