@@ -400,13 +400,13 @@ class AcmeWorker:
     def _position(self):
         # Only process messages that arrive after this container starts.
         # Never fall back to beginning() — that would replay old challenges.
-        if not hasattr(volga.Position, 'latest'):
+        if not hasattr(volga.Position, 'end'):
             raise RuntimeError(
-                "volga.Position.latest() is not available in this client version. "
+                "volga.Position.end() is not available in this client version. "
                 "Refusing to start to avoid replaying old ACME challenges."
             )
-        logging.info("Consumer position: latest (skipping historical messages)")
-        return volga.Position.latest()
+        logging.info("Consumer position: end (skipping historical messages)")
+        return volga.Position.end()
 
     def _is_token_expired_error(self, e: Exception) -> bool:
         err = str(e)
