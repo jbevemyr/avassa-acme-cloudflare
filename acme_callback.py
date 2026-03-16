@@ -412,6 +412,19 @@ class AcmeWorker:
         err = str(e)
         return "4200" in err or "Token expired" in err or "token expired" in err
 
+    def _is_connection_error(self, e: Exception) -> bool:
+        """Return True for WebSocket/network errors that require a full reconnect."""
+        err = str(e).lower()
+        return any(phrase in err for phrase in [
+            "no close frame",
+            "connection closed",
+            "connection reset",
+            "connection lost",
+            "websocket",
+            "eof occurred",
+            "broken pipe",
+        ])
+
     async def _process_message(
         self,
         payload: dict,
@@ -426,8 +439,8 @@ class AcmeWorker:
                 await producer.produce(ack)
             logging.info(f"Sent acknowledgment: {ack.get('status', 'unknown')}")
         except Exception as e:
-            if self._is_token_expired_error(e):
-                logging.warning(f"Session token expired in task, triggering reconnect: {e}")
+            if self._is_token_expired_error(e) or self._is_connection_error(e):
+                logging.warning(f"Session/connection error in task, triggering reconnect: {e}")
                 reconnect_event.set()
             else:
                 logging.error(f"Error processing message: {e}")
@@ -531,6 +544,10 @@ class AcmeWorker:
                             except Exception as e:
                                 if self._is_token_expired_error(e):
                                     logging.warning(f"Session token expired, reconnecting: {e}")
+                                    reconnect_event.set()
+                                    break
+                                if self._is_connection_error(e):
+                                    logging.warning(f"Connection lost, reconnecting: {e}")
                                     reconnect_event.set()
                                     break
                                 logging.error(f"Error receiving message: {e}")
