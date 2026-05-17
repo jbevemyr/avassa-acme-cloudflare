@@ -321,6 +321,7 @@ class AcmeWorker:
             logging.info("This instance manages ALL domains (no domain filtering)")
         self.hostname = socket.gethostname()
         self._shutdown = asyncio.Event()
+        self._fatal_error: Optional[str] = None
 
         # Token management
         self.session: Optional[avassa_client.Session] = None
@@ -364,32 +365,146 @@ class AcmeWorker:
 
         if hasattr(session, 'expires_in'):
             self.token_expires_at = time.time() + session.expires_in
-            logging.info(f"Token expires in {session.expires_in}s "
-                         f"(proactive reconnect at -{self.refresh_margin_seconds}s)")
+            logging.info(
+                f"Token expires in {session.expires_in}s "
+                f"(refresh at -{self.refresh_margin_seconds}s)"
+            )
         else:
             self.token_expires_at = None
-            logging.info("Token lifetime unknown — relying on 4200 reconnect handler")
+            logging.info("Token lifetime unknown — no proactive refresh scheduling")
 
         return session
 
     def _needs_token_refresh(self) -> bool:
-        """Return True when we should proactively reconnect before token expiry."""
+        """Return True when we should refresh token before expiry."""
         if not self.token_expires_at:
             return False
         return time.time() >= (self.token_expires_at - self.refresh_margin_seconds)
 
+    def _extract_expires_in(self, payload: object) -> Optional[int]:
+        """Extract expires_in from refresh response payload."""
+        if not isinstance(payload, dict):
+            return None
+        for key in ("expires-in", "expires_in", "expiresIn"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                logging.warning(f"Could not parse token lifetime from {key}={value!r}")
+                return None
+        return None
+
+    def _extract_refreshed_token(self, payload: object) -> Optional[str]:
+        """Extract refreshed token string from refresh response payload."""
+        if not isinstance(payload, dict):
+            return None
+        for key in ("token", "access_token", "access-token"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _set_session_token(self, token: str) -> bool:
+        """
+        Best-effort update of token on the in-memory session object.
+        Different avassa_client versions may use different attribute names.
+        """
+        if not self.session:
+            return False
+        for attr in ("token", "access_token", "_token"):
+            if hasattr(self.session, attr):
+                setattr(self.session, attr, token)
+                return True
+        return False
+
+    async def _refresh_session_token(self) -> bool:
+        """Refresh current Avassa token and update expiry metadata."""
+        if not self.session:
+            logging.error("Cannot refresh token without an active session")
+            return False
+
+        refresh_url = f"{self.api_host.rstrip('/')}/v1/state/strongbox/token/refresh"
+        logging.info("Refreshing Avassa session token...")
+
+        try:
+            if hasattr(avassa_client, "token_refresh"):
+                body = avassa_client.token_refresh(
+                    session=self.session,
+                    host=self.api_host,
+                    user_agent="volga-acme-cloudflare/1.0",
+                )
+            else:
+                (_code, _msg, _headers, body) = avassa_client.post_request(
+                    self.session,
+                    refresh_url,
+                    {},
+                    "volga-acme-cloudflare/1.0",
+                    None,
+                )
+        except Exception as e:
+            logging.error(f"Token refresh request failed: {e}")
+            return False
+
+        payload: object = {}
+        if isinstance(body, (bytes, bytearray)):
+            payload_text = body.decode("utf-8", errors="replace")
+        elif isinstance(body, str):
+            payload_text = body
+        else:
+            payload_text = ""
+            if isinstance(body, dict):
+                payload = body
+
+        if payload_text:
+            try:
+                payload = json.loads(payload_text)
+            except Exception:
+                logging.warning("Could not decode token refresh response as JSON")
+                payload = {}
+
+        expires_in = self._extract_expires_in(payload)
+        if expires_in:
+            self.token_expires_at = time.time() + expires_in
+            logging.info(
+                f"Token refresh successful, next expiry in {expires_in}s "
+                f"(refresh at -{self.refresh_margin_seconds}s)"
+            )
+        else:
+            self.token_expires_at = None
+            logging.warning(
+                "Token refresh succeeded but expires-in is missing; "
+                "proactive refresh scheduling disabled"
+            )
+
+        refreshed_token = self._extract_refreshed_token(payload)
+        if refreshed_token:
+            if self._set_session_token(refreshed_token):
+                logging.info("Updated in-memory session with refreshed token")
+            else:
+                logging.debug("Session token field not updated (attribute not found)")
+
+        return True
+
     async def _token_refresh_task(self, reconnect_event: asyncio.Event) -> None:
         """
-        Background task that triggers a graceful reconnect when the token is
-        approaching expiry.  Relies on the caller's reconnect_event so that the
-        Consumer/Producer are rebuilt together with the new session.
+        Background task that proactively refreshes token before expiry.
+        It stops when the current consumer/producer cycle is being reconnected.
         """
         while not self._shutdown.is_set() and not reconnect_event.is_set():
             try:
                 if self._needs_token_refresh():
-                    logging.info("Token approaching expiry — triggering proactive reconnect")
-                    reconnect_event.set()
-                    break
+                    ok = await self._refresh_session_token()
+                    if not ok:
+                        self._fatal_error = (
+                            "Token refresh failed; exiting so container can restart "
+                            "and obtain a new AppRole secret"
+                        )
+                        logging.critical(self._fatal_error)
+                        self._shutdown.set()
+                        reconnect_event.set()
+                        break
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
@@ -459,7 +574,8 @@ class AcmeWorker:
         try:
             while not self._shutdown.is_set():
                 try:
-                    self.session = await self._make_session()
+                    if self.session is None:
+                        self.session = await self._make_session()
 
                     # Create reconnect_event first so the refresh task can signal it
                     reconnect_event = asyncio.Event()
@@ -543,7 +659,14 @@ class AcmeWorker:
 
                             except Exception as e:
                                 if self._is_token_expired_error(e):
-                                    logging.warning(f"Session token expired, reconnecting: {e}")
+                                    logging.warning(
+                                        f"Session token expired, attempting immediate refresh: {e}"
+                                    )
+                                    if await self._refresh_session_token():
+                                        logging.info("Token refreshed, reconnecting stream clients...")
+                                    else:
+                                        logging.critical("Immediate token refresh failed")
+                                        raise
                                     reconnect_event.set()
                                     break
                                 if self._is_connection_error(e):
@@ -559,14 +682,16 @@ class AcmeWorker:
                             await asyncio.gather(*active_tasks, return_exceptions=True)
 
                     if reconnect_event.is_set():
-                        logging.info("Reconnecting with a fresh session...")
+                        if self._fatal_error:
+                            raise RuntimeError(self._fatal_error)
+                        logging.info("Reconnecting consumer/producer with existing session...")
                         await asyncio.sleep(2)
                         continue
 
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    if self._shutdown.is_set():
+                    if self._shutdown.is_set() and not self._fatal_error:
                         break
                     logging.critical(f"Fatal error, exiting so the container can restart: {e}")
                     raise
