@@ -167,7 +167,7 @@ The service automatically manages Avassa API token refresh to ensure continuous 
 - **Automatic Refresh**: Tokens are automatically refreshed 5 minutes before expiration
 - **Background Task**: A dedicated background task monitors token expiration
 - **Refresh Endpoint**: Uses `/v1/state/strongbox/token/refresh` to obtain new tokens
-- **Graceful Handling**: If token refresh fails, the service logs errors but continues attempting
+- **Fail-Fast on Refresh Errors**: If token refresh fails, the service exits so the container can restart and obtain a new AppRole secret
 - **Continuous Operation**: The service maintains an endless loop processing Volga messages
 
 ## Debugging ACME Validation Failures
