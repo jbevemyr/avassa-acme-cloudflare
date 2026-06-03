@@ -77,3 +77,7 @@ logs/
 # OS generated files
 Thumbs.db
 ehthumbs.db
+
+# Local developer setup (machine-specific, not for the repo)
+.mcp.json
+avassa-client-py

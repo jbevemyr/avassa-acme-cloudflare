@@ -421,7 +421,9 @@ main() {
         
         if [[ -n "$message" ]]; then
             # Process the message
-            process_message "$message"
+            if ! process_message "$message"; then
+                error "Message handling failed; continuing with next message"
+            fi
         else
             # No message received, continue waiting
             debug "No message received, continuing to wait..."

@@ -134,7 +134,7 @@ shell:
 run-dev:
 	@echo "Running Python script directly..."
 	@if [ ! -f .env ]; then \
-		echo "Warning: .env file not found. Copy .env.example to .env and configure it."; \
+		echo "Warning: .env file not found. Copy .env.template to .env and configure it."; \
 		exit 1; \
 	fi
 	@export $$(cat .env | grep -v '^#' | xargs) && python3 acme_callback.py

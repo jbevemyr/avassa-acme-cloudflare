@@ -12,7 +12,7 @@ A Python callback module that listens on Volga topics for JSON messages instruct
 - ✅ Automatic Avassa API token refresh before expiration
 - ✅ Continuous message processing with robust error handling
 - ✅ Multi-instance domain filtering for horizontal scaling
-- ✅ Shared consumer mode for concurrent processing
+- ✅ Safe consumer mode selection (shared without filtering, exclusive with domain filtering)
 - ✅ Complete error handling and logging
 - ✅ Configured via environment variables
 
@@ -142,7 +142,7 @@ _acme-challenge.www.example.co.uk
 The service supports horizontal scaling through domain-based partitioning:
 
 - **Domain-Specific Instances**: Each instance can be configured to handle specific domains using `MANAGED_DOMAINS`
-- **Shared Consumer Mode**: Uses Volga shared consumers to allow multiple instances to process messages concurrently
+- **Consumer Mode Safety**: Uses Volga shared consumers only when no domain filtering is enabled; switches to exclusive mode when `MANAGED_DOMAINS` is set so filtered messages are not dropped
 - **Message Filtering**: Only processes messages for domains it manages, allowing other instances to handle their domains
 - **Hierarchical Domains**: If an instance manages "example.com", it also handles subdomains like "sub.example.com"
 - **No Filtering**: If `MANAGED_DOMAINS` is not set, the instance handles all domains (backward compatibility)
@@ -312,7 +312,5 @@ Deploy using the provided Avassa specifications:
 supctl create applications < avassa-app.yaml
 
 # Then, create the application deployment
-supctl create application-deployment < avasas-deployment.yaml
+supctl create application-deployment < avassa-deployment.yaml
 ```
-
-
