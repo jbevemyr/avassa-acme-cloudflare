@@ -363,16 +363,7 @@ class AcmeWorker:
             user_agent="volga-acme-cloudflare/1.0",
         )
 
-        if hasattr(session, 'expires_in'):
-            self.token_expires_at = time.time() + session.expires_in
-            logging.info(
-                f"Token expires in {session.expires_in}s "
-                f"(refresh at -{self.refresh_margin_seconds}s)"
-            )
-        else:
-            self.token_expires_at = None
-            logging.info("Token lifetime unknown — no proactive refresh scheduling")
-
+        self._record_token_expiry(session)
         return session
 
     def _needs_token_refresh(self) -> bool:
@@ -381,115 +372,65 @@ class AcmeWorker:
             return False
         return time.time() >= (self.token_expires_at - self.refresh_margin_seconds)
 
-    def _extract_expires_in(self, payload: object) -> Optional[int]:
-        """Extract expires_in from refresh response payload."""
-        if not isinstance(payload, dict):
-            return None
-        for key in ("expires-in", "expires_in", "expiresIn"):
-            value = payload.get(key)
-            if value is None:
-                continue
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                logging.warning(f"Could not parse token lifetime from {key}={value!r}")
-                return None
-        return None
+    def _record_token_expiry(self, session: avassa_client.Session) -> None:
+        """Schedule proactive refresh from the session's absolute token expiry.
 
-    def _extract_refreshed_token(self, payload: object) -> Optional[str]:
-        """Extract refreshed token string from refresh response payload."""
-        if not isinstance(payload, dict):
-            return None
-        for key in ("token", "access_token", "access-token"):
-            value = payload.get(key)
-            if isinstance(value, str) and value:
-                return value
-        return None
-
-    def _set_session_token(self, token: str) -> bool:
+        approle_login() and Session.refresh_token() populate the session with the
+        token's absolute expiry (parsed from the login response's `expires` field
+        and exposed via get_token_expiry()). We refresh before that instant so the
+        token is always renewed while still valid — a refresh attempted after
+        expiry is rejected with HTTP 401.
         """
-        Best-effort update of token on the in-memory session object.
-        Different avassa_client versions may use different attribute names.
-        """
-        if not self.session:
-            return False
-        for attr in ("token", "access_token", "_token"):
-            if hasattr(self.session, attr):
-                setattr(self.session, attr, token)
-                return True
-        return False
-
-    async def _refresh_session_token(self) -> bool:
-        """Refresh current Avassa token and update expiry metadata."""
-        if not self.session:
-            logging.error("Cannot refresh token without an active session")
-            return False
-
-        refresh_url = f"{self.api_host.rstrip('/')}/v1/state/strongbox/token/refresh"
-        logging.info("Refreshing Avassa session token...")
-
-        try:
-            if hasattr(avassa_client, "token_refresh"):
-                body = avassa_client.token_refresh(
-                    session=self.session,
-                    host=self.api_host,
-                    user_agent="volga-acme-cloudflare/1.0",
-                )
-            else:
-                (_code, _msg, _headers, body) = avassa_client.post_request(
-                    self.session,
-                    refresh_url,
-                    {},
-                    "volga-acme-cloudflare/1.0",
-                    None,
-                )
-        except Exception as e:
-            logging.error(f"Token refresh request failed: {e}")
-            return False
-
-        payload: object = {}
-        if isinstance(body, (bytes, bytearray)):
-            payload_text = body.decode("utf-8", errors="replace")
-        elif isinstance(body, str):
-            payload_text = body
-        else:
-            payload_text = ""
-            if isinstance(body, dict):
-                payload = body
-
-        if payload_text:
-            try:
-                payload = json.loads(payload_text)
-            except Exception:
-                logging.warning("Could not decode token refresh response as JSON")
-                payload = {}
-
-        expires_in = self._extract_expires_in(payload)
-        if expires_in:
-            self.token_expires_at = time.time() + expires_in
+        expiry = None
+        get_expiry = getattr(session, "get_token_expiry", None)
+        if callable(get_expiry):
+            expiry = get_expiry()
+        if expiry is not None:
+            self.token_expires_at = expiry.timestamp()
+            remaining = int(self.token_expires_at - time.time())
             logging.info(
-                f"Token refresh successful, next expiry in {expires_in}s "
+                f"Token expires in {remaining}s "
                 f"(refresh at -{self.refresh_margin_seconds}s)"
             )
         else:
             self.token_expires_at = None
-            logging.warning(
-                "Token refresh succeeded but expires-in is missing; "
-                "proactive refresh scheduling disabled"
+            logging.info("Token lifetime unknown — no proactive refresh scheduling")
+
+    async def _refresh_session_token(self) -> bool:
+        """Refresh the current Avassa token in place and reschedule the next refresh.
+
+        Uses Session.refresh_token() (POST /v1/state/strongbox/token/refresh),
+        which renews the in-memory token and re-reads the new expiry without
+        needing the (single-use) AppRole secret. Runs in a worker thread because
+        the client performs blocking HTTP.
+        """
+        if not self.session:
+            logging.error("Cannot refresh token without an active session")
+            return False
+
+        refresh = getattr(self.session, "refresh_token", None)
+        if not callable(refresh):
+            logging.error(
+                "avassa_client.Session has no refresh_token(); cannot refresh token"
             )
+            return False
 
-        refreshed_token = self._extract_refreshed_token(payload)
-        if refreshed_token:
-            if self._set_session_token(refreshed_token):
-                logging.info("Updated in-memory session with refreshed token")
-            else:
-                logging.debug("Session token field not updated (attribute not found)")
+        logging.info("Refreshing Avassa session token...")
+        try:
+            await asyncio.to_thread(refresh)
+        except Exception as e:
+            logging.error(f"Token refresh request failed: {e}")
+            return False
 
+        self._record_token_expiry(self.session)
         return True
 
     async def _token_refresh_task(self, reconnect_event: asyncio.Event) -> None:
         """
-        Background task that proactively refreshes token before expiry.
+        Background task that proactively refreshes the token before expiry and
+        then triggers a reconnect so the consumer/producer re-handshake with the
+        new token. The existing WebSocket was authenticated with the old token at
+        connect time and would otherwise be closed (4200) when it expires.
         It stops when the current consumer/producer cycle is being reconnected.
         """
         while not self._shutdown.is_set() and not reconnect_event.is_set():
@@ -505,6 +446,12 @@ class AcmeWorker:
                         self._shutdown.set()
                         reconnect_event.set()
                         break
+                    logging.info(
+                        "Token refreshed proactively — reconnecting stream clients "
+                        "with the new token"
+                    )
+                    reconnect_event.set()
+                    break
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break

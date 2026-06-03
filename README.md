@@ -164,9 +164,11 @@ export MANAGED_DOMAINS="test.org,demo.net"
 
 The service automatically manages Avassa API token refresh to ensure continuous operation:
 
-- **Automatic Refresh**: Tokens are automatically refreshed 5 minutes before expiration
+- **Token Lifetime**: Read from the login response's `expires` field (via `Session.get_token_expiry()`); proactive refresh is scheduled only when this is known
+- **Automatic Refresh**: Tokens are refreshed proactively, 5 minutes before expiration, while the current token is still valid (a refresh attempted after expiry is rejected with HTTP 401)
 - **Background Task**: A dedicated background task monitors token expiration
-- **Refresh Endpoint**: Uses `/v1/state/strongbox/token/refresh` to obtain new tokens
+- **Refresh Endpoint**: Uses `Session.refresh_token()` (`POST /v1/state/strongbox/token/refresh`), which renews the token without needing the single-use AppRole secret
+- **Reconnect After Refresh**: After a successful refresh the consumer/producer are reconnected so the Volga WebSocket re-handshakes with the new token (the old WebSocket would otherwise be closed with code 4200 when its token expires)
 - **Fail-Fast on Refresh Errors**: If token refresh fails, the service exits so the container can restart and obtain a new AppRole secret
 - **Continuous Operation**: The service maintains an endless loop processing Volga messages
 
