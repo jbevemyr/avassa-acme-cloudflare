@@ -568,13 +568,58 @@ class AcmeWorker:
                         await consumer.more(max_concurrent)
                         logging.info("Ready to process ACME challenge requests...")
 
-                        while not self._shutdown.is_set() and not reconnect_event.is_set():
-                            try:
-                                msg = await consumer.recv()
+                        # consumer.recv() blocks on the WebSocket until a message
+                        # arrives or the socket closes — it never returns on an idle
+                        # topic. So we cannot rely on the loop re-checking
+                        # reconnect_event between recv() calls: a proactive token
+                        # refresh would set the event but go unobserved until the
+                        # token expired and recv() raised 4200. Instead, race recv()
+                        # against the event so a reconnect request is acted on at once.
+                        reconnect_waiter = asyncio.ensure_future(reconnect_event.wait())
+                        try:
+                            while not self._shutdown.is_set() and not reconnect_event.is_set():
+                                recv_task = asyncio.ensure_future(consumer.recv())
+                                await asyncio.wait(
+                                    {recv_task, reconnect_waiter},
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+
+                                # Prune completed in-flight tasks on each wakeup.
+                                active_tasks = {t for t in active_tasks if not t.done()}
+
+                                # A proactive refresh (or a background task) asked us to
+                                # reconnect; cancel the pending recv() and rebuild the
+                                # consumer/producer with the refreshed token.
+                                if reconnect_event.is_set():
+                                    recv_task.cancel()
+                                    try:
+                                        await recv_task
+                                    except BaseException:
+                                        pass
+                                    break
+
+                                try:
+                                    msg = recv_task.result()
+                                except Exception as e:
+                                    if self._is_token_expired_error(e):
+                                        logging.warning(
+                                            f"Session token expired, attempting immediate refresh: {e}"
+                                        )
+                                        if await self._refresh_session_token():
+                                            logging.info("Token refreshed, reconnecting stream clients...")
+                                        else:
+                                            logging.critical("Immediate token refresh failed")
+                                            raise
+                                        reconnect_event.set()
+                                        break
+                                    if self._is_connection_error(e):
+                                        logging.warning(f"Connection lost, reconnecting: {e}")
+                                        reconnect_event.set()
+                                        break
+                                    logging.error(f"Error receiving message: {e}")
+                                    continue
+
                                 if not msg:
-                                    await asyncio.sleep(0.2)
-                                    # Prune completed tasks
-                                    active_tasks = {t for t in active_tasks if not t.done()}
                                     continue
 
                                 payload = msg.get("payload", {})
@@ -603,25 +648,12 @@ class AcmeWorker:
 
                                 # Replenish one consumer credit per accepted task
                                 await consumer.more(1)
-
-                            except Exception as e:
-                                if self._is_token_expired_error(e):
-                                    logging.warning(
-                                        f"Session token expired, attempting immediate refresh: {e}"
-                                    )
-                                    if await self._refresh_session_token():
-                                        logging.info("Token refreshed, reconnecting stream clients...")
-                                    else:
-                                        logging.critical("Immediate token refresh failed")
-                                        raise
-                                    reconnect_event.set()
-                                    break
-                                if self._is_connection_error(e):
-                                    logging.warning(f"Connection lost, reconnecting: {e}")
-                                    reconnect_event.set()
-                                    break
-                                logging.error(f"Error receiving message: {e}")
-                                continue
+                        finally:
+                            reconnect_waiter.cancel()
+                            try:
+                                await reconnect_waiter
+                            except BaseException:
+                                pass
 
                         # Wait for in-flight tasks before tearing down
                         if active_tasks:
