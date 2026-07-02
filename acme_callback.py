@@ -70,14 +70,13 @@ import logging
 import time
 from typing import Optional, Tuple
 
-from cloudflare import AsyncCloudflare
-from cloudflare._exceptions import CloudflareError
+from cloudflare import AsyncCloudflare, CloudflareError
 import avassa_client
 import avassa_client.volga as volga
 
 # Set up logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
@@ -299,8 +298,9 @@ class AcmeWorker:
         self.role_id = os.environ["VOLGA_ROLE_ID"]
         self.approle_secret = os.environ["APPROLE_SECRET_ID"]
         self.api_host = os.getenv("AVASSA_API_HOST", "https://api.internal:4646")
-        self.api_ca_cert = os.getenv("API_CA_CERT")
-        
+        # API_CA_CERT is read directly by avassa_client.create_ssl_context()
+        # (loaded into the TLS trust store), so it is intentionally not stored here.
+
         # Hardcoded Volga settings - these rarely need to change
         self.topic_in = "acme:requests"
         self.topic_out = "acme:events"
