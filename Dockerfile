@@ -1,4 +1,6 @@
-FROM python:3-slim
+# Pinned to the tested minor (the image currently resolves python:3-slim to
+# 3.14). Bump deliberately; for full reproducibility pin to a digest.
+FROM python:3.14-slim
 
 WORKDIR /app
 

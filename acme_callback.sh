@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# LEGACY / UNMAINTAINED: the deployed container runs the Python implementation
+# (acme_callback.py; see Dockerfile). This shell variant is kept only as a
+# minimal reference for basic/testing integrations and is NOT built into the
+# image. Security note: it passes CF_API_TOKEN via `curl -H "Authorization:
+# Bearer ..."`, which is visible in process arguments (/proc/<pid>/cmdline) to
+# other local users while curl runs; do not use it on multi-user hosts.
+#
 # Simple shell script ACME DNS callback for Avassa Volga
 # 
 # This script listens to the acme:requests Volga topic, processes DNS challenge
